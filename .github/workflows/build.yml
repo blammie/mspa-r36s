@@ -1,0 +1,26 @@
+name: build-aarch64
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm   # native arm64, glibc 2.35 (runs on older handheld firmwares too)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y gcc make libsdl2-dev libsdl2-ttf-dev
+      - name: Compile
+        run: make
+      - name: Collect binary and libraries
+        run: |
+          mkdir -p out/libs.aarch64
+          cp mspa_reader.aarch64 out/
+          ldd out/mspa_reader.aarch64
+          ldd out/mspa_reader.aarch64 | awk '/=> \//{print $3}' \
+            | grep -Ev '/(libc|libm|libdl|libpthread|librt|libgcc_s|libSDL2-2\.0|ld-linux-aarch64)\.so' \
+            | xargs -r -I{} cp -L {} out/libs.aarch64/
+          ls -la out out/libs.aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mspa-aarch64
+          path: out
