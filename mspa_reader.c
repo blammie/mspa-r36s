@@ -1540,20 +1540,39 @@ static void play_external(int kind) {
     const char *path = NULL;
     for (int i = 0; i < nMedia; i++) if (media[i].kind == kind) { path = media[i].path; break; }
     if (!path) return;
-    if (flashPid > 0) { kill(flashPid, SIGTERM); waitpid(flashPid, NULL, 0); flashPid = 0; }
-    CT.scroll = scrollY; save_tabs();
+
+    /* Kill the entire process group of any existing media */
+if (flashPid > 0) {
+    int status;
+    pid_t res = waitpid(flashPid, &status, WNOHANG);
+    if (res != 0) {
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 2) toast("No video player found");
+        flashPid = 0;
+        SDL_RestoreWindow(win); /* Bring reader back when media finishes */
+    }
+}
+    CT.scroll = scrollY;
+    save_tabs();
+
+    /* Hide the reader so the flash/video appears on top */
+    SDL_MinimizeWindow(win);
+
     pid_t pid = fork();
     if (pid == 0) {
+        /* --- CHILD PROCESS --- */
+        setpgid(0, 0); /* Put child in its own process group so we can kill the whole tree */
         setenv(kind == 1 ? "MSPA_SWF" : "MSPA_VIDEO", path, 1);
         setenv("MSPA_FLASH_ENGINE", cfg.flashEngine ? "handheld" : "classic", 1);
         execl("/bin/bash", "bash", kind == 1 ? "./run_flash.sh" : "./run_video.sh", (char *)NULL);
         _exit(1);
     } else if (pid > 0) {
+        /* --- PARENT PROCESS --- */
         flashPid = pid;
-        toast("Media started. Select+Start to close.");
-    } else { toast("Failed to start media"); }
+    } else {
+        toast("Failed to start media");
+        SDL_RestoreWindow(win);
+    }
 }
-
 static void restore_tabs(void) {
     char *s = (char *)read_file("conf/tabs.txt", NULL);
     if (!s) return;
@@ -2304,13 +2323,18 @@ int main(int argc, char **argv) {
             if (b == SDL_CONTROLLER_BUTTON_DPAD_UP) dpadDir = down ? -1 : (dpadDir == -1 ? 0 : dpadDir);
             if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) dpadDir = down ? 1 : (dpadDir == 1 ? 0 : dpadDir);
             if (!down) continue;
-            if (b == SDL_CONTROLLER_BUTTON_START && selectHeld) {
+if (b == SDL_CONTROLLER_BUTTON_START && selectHeld) {
     if (flashPid > 0) {
-        kill(flashPid, SIGTERM); waitpid(flashPid, NULL, 0); flashPid = 0;
+        kill(-flashPid, SIGTERM); /* Kill the whole process group */
+        waitpid(flashPid, NULL, 0);
+        flashPid = 0;
+        SDL_RestoreWindow(win); /* Bring the reader back */
         toast("Media closed");
-    } else { running = false; }
+    } else {
+        running = false; 
+    }
     continue;
-}   /* Select+Start = quit */
+}
             if (b == SDL_CONTROLLER_BUTTON_BACK) continue;
             if (menuMode) {
                 if (libLevel == 0) handle_menu(b);
