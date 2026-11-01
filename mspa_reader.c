@@ -65,6 +65,8 @@ static const SDL_Color C_CARDTXT = {235, 235, 235, 255};
 static const SDL_Color C_TABBG = {40, 40, 40, 255};
 static const SDL_Color C_TABOFF = {75, 75, 75, 255};
 static const SDL_Color C_HILITE = {255, 247, 190, 255};
+static const SDL_Color C_VISITED = {85, 26, 139, 255};
+static const SDL_Color C_WHITE = {250, 250, 250, 255};
 
 /* ---------------------------------------------------------------- types */
 typedef struct { const char *k; uint32_t l; const JNode *n; } Key;
@@ -143,7 +145,6 @@ typedef struct { char sid[110]; char key[24]; } Bm;
 static SDL_Window *win;
 static SDL_Renderer *ren;
 static TTF_Font *fTitle, *fBody, *fCmd, *fLink, *fFoot, *fFootU, *fMenu;
-static bool swapAB;
 
 static char assets[512] = "";
 static char loadError[256];
@@ -182,6 +183,18 @@ static int libLevel, selCat, selEnt;
 static int dpadDir, stickDir;
 static char toastMsg[200];
 static uint32_t toastUntil;
+typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB; } Settings;
+static Settings cfg = {55, 1, false, true, false};   /* imgPct: 30..150, 999 = fit column width */
+static uint8_t *visitedBits[2];
+static bool logOpen, logPresent, autoRequest, g_noAuto, g_logs;
+static bool selectHeld;
+static int gotoDigits[6], gotoPos, gotoWidth;
+static int setSel;
+enum { MI_HEAD, MI_SRC, MI_CAT, MI_ACT };
+enum { ACT_GOTO, ACT_SETTINGS, ACT_CONTROLS };
+typedef struct { int type, a; } MItem;
+static MItem menu[48];
+static int nMenu, selMenu, menuScroll;
 static bool g_links, g_inl;
 static int curLinkIdx = -1;
 
@@ -643,6 +656,76 @@ static bool src_load_page(int si, const char *key, Page *p) {
 
 static void page_free(Page *p) { free(p->html); p->html = NULL; p->valid = false; }
 
+/* ------------------------------------------------------------ settings / read history */
+static void settings_save(void) {
+    FILE *f = fopen("conf/settings.txt", "w");
+    if (!f) return;
+    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\n",
+            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+}
+
+static void settings_load(void) {
+    char *s = (char *)read_file("conf/settings.txt", NULL);
+    if (!s) return;
+    for (char *line = strtok(s, "\n"); line; line = strtok(NULL, "\n")) {
+        int v;
+        if (sscanf(line, "imgpct=%d", &v) == 1) cfg.imgPct = v >= 999 ? 999 : v < 30 ? 30 : v > 150 ? 150 : v;
+        else if (sscanf(line, "textsize=%d", &v) == 1) cfg.textSize = v < 0 ? 0 : v > 2 ? 2 : v;
+        else if (sscanf(line, "autoflash=%d", &v) == 1) cfg.autoFlash = v != 0;
+        else if (sscanf(line, "collapselogs=%d", &v) == 1) cfg.collapseLogs = v != 0;
+        else if (sscanf(line, "swapab=%d", &v) == 1) cfg.swapAB = v != 0;
+    }
+    free(s);
+}
+
+#define VIS_BYTES 125000   /* one bit per page number 0..999999, per section */
+static void visited_load(void) {
+    for (int i = 0; i < 2; i++) visitedBits[i] = calloc(VIS_BYTES, 1);
+    FILE *f = fopen("conf/visited.bin", "rb");
+    if (!f) return;
+    for (int i = 0; i < 2; i++) if (fread(visitedBits[i], 1, VIS_BYTES, f) != VIS_BYTES) break;
+    fclose(f);
+}
+
+static bool vis_num(const char *id, int *n) {
+    if (!*id || strlen(id) > 6) return false;
+    for (const char *c = id; *c; c++) if (!isdigit((unsigned char)*c)) return false;
+    *n = atoi(id);
+    return true;
+}
+
+static bool is_visited(int s, const char *id) {
+    int n;
+    if (s < 0 || s > 1 || !visitedBits[s] || !vis_num(id, &n)) return false;
+    return (visitedBits[s][n >> 3] >> (n & 7)) & 1;
+}
+
+static void mark_visited(int s, const char *id) {
+    int n;
+    if (s < 0 || s > 1 || !visitedBits[s] || !vis_num(id, &n)) return;
+    uint8_t *b = &visitedBits[s][n >> 3];
+    if ((*b >> (n & 7)) & 1) return;
+    *b |= (uint8_t)(1 << (n & 7));
+    FILE *f = fopen("conf/visited.bin", "r+b");
+    if (!f) {
+        f = fopen("conf/visited.bin", "w+b");
+        if (f) { static uint8_t z[4096]; for (long i = 0; i < 2L * VIS_BYTES; i += (long)sizeof z) fwrite(z, 1, sizeof z, f); }
+    }
+    if (!f) return;
+    fseek(f, (long)s * VIS_BYTES + (n >> 3), SEEK_SET);
+    fputc(*b, f);
+    fflush(f);
+    fclose(f);
+}
+
+static void visited_clear(void) {
+    for (int i = 0; i < 2; i++) if (visitedBits[i]) memset(visitedBits[i], 0, VIS_BYTES);
+    remove("conf/visited.bin");
+}
+
 /* ------------------------------------------------------------ bookmarks / tabs file */
 static const char *bm_get(const char *sid) {
     for (int i = 0; i < nBms; i++) if (!strcmp(bms[i].sid, sid)) return bms[i].key;
@@ -914,16 +997,18 @@ static void layout_html(TTF_Font *f, const char *html, SDL_Color base, int boxX,
                 }
                 if (sp < 23) stack[++sp] = fix_color(c); else stack[sp] = fix_color(c);
             } else if (!strcmp(name, "a") && !closing) {
+                SDL_Color lc = C_LINK;
                 if (g_links && nLinks < MAX_LINKS) {
                     Link *lk = &links[nLinks];
                     memset(lk, 0, sizeof *lk);
                     if (tag_attr(p, e, "href", lk->url, sizeof lk->url)) {
                         decode_entities(lk->url);
                         classify_link(lk);
+                        if (lk->kind == LK_PAGE && is_visited(0, lk->target)) lc = C_VISITED;
                         curLinkIdx = nLinks++;
                     }
                 }
-                if (sp < 23) stack[++sp] = C_LINK;
+                if (sp < 23) stack[++sp] = lc;
             } else if ((!strcmp(name, "span") || !strcmp(name, "a")) && closing) {
                 if (!strcmp(name, "a")) curLinkIdx = -1;
                 if (sp > 0) sp--;
@@ -944,6 +1029,25 @@ static void layout_html(TTF_Font *f, const char *html, SDL_Color base, int boxX,
             if (*q == '|' && q - p >= 5) {
                 FLUSH_WORD();
                 if (ln) line_emit(f, boxX, boxW, center, y);
+                if (g_logs) {
+                    char nm[24];
+                    size_t nl2 = (size_t)(q - p - 1);
+                    if (nl2 >= sizeof nm) nl2 = sizeof nm - 1;
+                    memcpy(nm, p + 1, nl2);
+                    nm[nl2] = 0;
+                    const char *lab = !strcmp(nm, "PESTERLOG") ? "Pesterlog" : !strcmp(nm, "DIALOGLOG") ? "Dialoglog"
+                                    : !strcmp(nm, "SPRITELOG") ? "Spritelog" : !strcmp(nm, "JOURNALOG") ? "Journal log"
+                                    : !strcmp(nm, "AUTHORLOG") ? "Author log" : !strcmp(nm, "TRKSTRLOG") ? "Trickster log" : "Log";
+                    char row[96];
+                    snprintf(row, sizeof row, "%s %s (Y)", logOpen ? "[-] Hide" : "[+] Show", lab);
+                    int rw = 0;
+                    TTF_SizeUTF8(fLink, row, &rw, NULL);
+                    logPresent = true;
+                    *y += 6;
+                    item_add(fLink, row, C_LINK, boxX + (boxW - rw) / 2, *y);
+                    *y += TTF_FontLineSkip(fLink) + 10;
+                    if (!logOpen) break;
+                }
                 center = false;
                 p = q + 1;
                 sawSpace = true;
@@ -1092,6 +1196,7 @@ static void build_page(void) {
     items_clear();
     nLinks = 0;
     curLinkIdx = -1;
+    logPresent = false;
     int y = COL_TOP + 12;
     int bx = PAD, bw = COL_W - 2 * PAD;
     int mainMedia = nMedia;
@@ -1104,7 +1209,8 @@ static void build_page(void) {
         Media *m = &media[i];
         m->y = y;
         if (m->kind == 0) {
-            float s = m->w > COL_W ? (float)COL_W / (float)m->w : 1.0f;
+            float s = cfg.imgPct >= 999 ? 1.0f : (float)cfg.imgPct / 100.0f;
+            if ((float)m->w * s > (float)COL_W || (cfg.imgPct >= 999 && m->w > COL_W)) s = (float)COL_W / (float)m->w;
             m->dw = (int)((float)m->w * s + 0.5f);
             m->dh = (int)((float)m->h * s + 0.5f);
             y += m->dh + 2;
@@ -1134,9 +1240,9 @@ static void build_page(void) {
 
     y += 14;
     if (page.html && page.html[0]) {
-        g_links = g_inl = true;
+        g_links = g_inl = g_logs = true;
         layout_html(fBody, page.html, C_BLACK, bx, bw, true, &y);
-        g_links = g_inl = false;
+        g_links = g_inl = g_logs = false;
         y += 6;
     }
 
@@ -1160,7 +1266,8 @@ static void build_page(void) {
         int pw = 0;
         if (!arrow) { TTF_SizeUTF8(fCmd, "> ", &pw, NULL); item_add(fCmd, ">", C_BLACK, bx, y); }
         int cy = y;
-        layout_html(fLink, choiceText[i][0] ? choiceText[i] : "...", C_LINK, bx + pw, bw - pw, false, &cy);
+        bool seen = srcs[CT.src].kind == SK_STORY && is_visited(srcs[CT.src].sect, page.next[i]);
+        layout_html(fLink, choiceText[i][0] ? choiceText[i] : "...", seen ? C_VISITED : C_LINK, bx + pw, bw - pw, false, &cy);
         y = cy + 10;
         choiceBot[i] = y - 6;
     }
@@ -1197,6 +1304,20 @@ static void build_page(void) {
     pageH = y + COL_TOP;
 }
 
+/* re-layout the current page (settings changed, log toggled) without reloading its media */
+static void rebuild_layout(void) {
+    if (!havePage) return;
+    for (int i = page.nmedia; i < nMedia; i++) {
+        if (media[i].tex) SDL_DestroyTexture(media[i].tex);
+        gif_close(media[i].gif);
+        memset(&media[i], 0, sizeof media[i]);
+    }
+    nMedia = page.nmedia;
+    build_page();
+    int ms = pageH > VIEW_H ? pageH - VIEW_H : 0;
+    if (scrollY > ms) scrollY = ms;
+}
+
 /* ------------------------------------------------------------- video / window */
 static bool video_init(void) {
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) return false;
@@ -1227,7 +1348,7 @@ static int max_scroll(void) { return pageH > VIEW_H ? pageH - VIEW_H : 0; }
 
 static void open_page(const char *key, bool push) {
     Page np;
-    if (!src_load_page(CT.src, key, &np)) { toast("Page not found: %.60s", key); return; }
+    if (!src_load_page(CT.src, key, &np)) { g_noAuto = false; toast("Page not found: %.60s", key); return; }
     media_free();
     if (push && havePage) {
         if (CT.nHist >= HIST_MAX) { memmove(CT.hist[0], CT.hist[1], (size_t)(HIST_MAX - 1) * 24); CT.nHist = HIST_MAX - 1; }
@@ -1244,7 +1365,11 @@ static void open_page(const char *key, bool push) {
     scrollY = 0;
     selChoice = 0;
     overlay = 0;
+    logOpen = !cfg.collapseLogs;
     build_page();
+    if (srcs[CT.src].kind == SK_STORY) mark_visited(srcs[CT.src].sect, page.id);
+    autoRequest = cfg.autoFlash && has_kind(1) && !g_noAuto;
+    g_noAuto = false;
     snprintf(CT.key, sizeof CT.key, "%s", page.id);
     if (srcs[CT.src].kind != SK_SINGLE) bm_set(srcs[CT.src].id, page.id);
     save_tabs();
@@ -1260,8 +1385,10 @@ static void go_next(void) {
 static void go_prev(void) {
     if (!havePage) return;
     char k[24];
+    g_noAuto = true;
     if (CT.nHist > 0) { snprintf(k, sizeof k, "%s", CT.hist[--CT.nHist]); open_page(k, false); return; }
     if (page.prev[0]) { snprintf(k, sizeof k, "%s", page.prev); open_page(k, false); }
+    g_noAuto = false;
 }
 
 static void jump(int steps) {
@@ -1322,6 +1449,7 @@ static void tab_show(int i) {
     int sc = CT.scroll;
     char k[24];
     snprintf(k, sizeof k, "%s", CT.key);
+    g_noAuto = true;
     open_page(k, false);
     scrollY = sc > max_scroll() ? max_scroll() : sc;
     save_tabs();
@@ -1420,7 +1548,9 @@ static void play_external(int kind) {
     setenv(kind == 1 ? "MSPA_SWF" : "MSPA_VIDEO", p, 1);
     int rc = system(kind == 1 ? "bash ./run_flash.sh" : "bash ./run_video.sh");
     dpadDir = stickDir = 0;
+    selectHeld = false;
     video_init();
+    g_noAuto = true;
     open_page(key, false);
     scrollY = sc > max_scroll() ? max_scroll() : sc;
     if (kind == 3 && WIFEXITED(rc) && WEXITSTATUS(rc) == 2) toast("No video player found on this system");
@@ -1458,7 +1588,51 @@ static void restore_tabs(void) {
     }
 }
 
-/* ------------------------------------------------------------- rendering */
+/* go to a page number: story ids are 6 digits, galleries are 1-based */
+static void goto_number(int n) {
+    if (nTabs == 0) return;
+    int si = CT.src;
+    if (srcs[si].kind == SK_STORY) {
+        char id[24];
+        for (int d = 0; d <= 300; d++) {
+            for (int sgn = 1; sgn >= -1; sgn -= 2) {
+                int c = n + sgn * d;
+                if (c < 0 || c > 999999 || (d == 0 && sgn < 0)) continue;
+                snprintf(id, sizeof id, "%06d", c);
+                if (find_page(srcs[si].sect, id)) {
+                    if (d) toast("Page %06d isn't in the story data - went to %s", n, id);
+                    int ns = srcs[si].sect == 0 ? story_for_id(id) : si;
+                    goto_here(ns, id);
+                    return;
+                }
+            }
+        }
+        toast("No page near %06d", n);
+    } else {
+        int cnt = src_count(si);
+        int idx = n - 1;
+        if (idx < 0) idx = 0;
+        if (idx >= cnt) idx = cnt - 1;
+        char id[24];
+        snprintf(id, sizeof id, "%d", idx);
+        goto_here(si, id);
+    }
+}
+
+static void goto_dialog_open(void) {
+    if (nTabs == 0) { lib_open(4, true); if (nTabs == 0) return; }
+    menuMode = false;
+    int v = 0;
+    if (srcs[CT.src].kind == SK_STORY) { gotoWidth = 6; vis_num(page.id, &v); }
+    else { gotoWidth = 4; int cnt = src_count(CT.src); gotoWidth = cnt > 999 ? 4 : cnt > 99 ? 3 : 2; v = atoi(page.id) + 1; }
+    for (int i = gotoWidth - 1; i >= 0; i--) { gotoDigits[i] = v % 10; v /= 10; }
+    gotoPos = gotoWidth - 1;
+    overlay = 2;
+}
+
+/* ------------------------------------------------------------- rendering helpers */
+static TTF_Font *fCtl;
+
 static void fill(SDL_Color c, int x, int y, int w, int h) {
     SDL_SetRenderDrawColor(ren, c.r, c.g, c.b, 255);
     SDL_Rect r = {x, y, w, h};
@@ -1487,6 +1661,12 @@ static void draw_center(TTF_Font *f, const char *s, int y, SDL_Color c) {
     int w = 0;
     TTF_SizeUTF8(f, s, &w, NULL);
     draw_str(f, s, (SCR_W - w) / 2, y, c);
+}
+
+static void draw_right(TTF_Font *f, const char *s, int xr, int y, SDL_Color c) {
+    int w = 0;
+    TTF_SizeUTF8(f, s, &w, NULL);
+    draw_str(f, s, xr - w, y, c);
 }
 
 /* shorten `in` with ".." until it fits maxw pixels */
@@ -1522,11 +1702,9 @@ static void draw_tabbar(void) {
     for (int i = 0; i < nTabs; i++) {
         bool sel = i == curTab && !menuMode;
         fill(sel ? C_COL : C_TABOFF, i * w + 1, 2, w - 2, TB - 2);
-        char lab[160], fit[200], num[8];
+        char lab[160], fit[200], full[200];
         tab_label(i, lab, sizeof lab);
-        snprintf(num, sizeof num, "%d ", i + 1);
-        char full[200];
-        snprintf(full, sizeof full, "%s%s", num, lab);
+        snprintf(full, sizeof full, "%d %s", i + 1, lab);
         fit_text(fFoot, full, w - 12, fit, sizeof fit);
         draw_str(fFoot, fit, i * w + 6, 5, sel ? C_BLACK : (SDL_Color){215, 215, 215, 255});
     }
@@ -1537,7 +1715,97 @@ static int cat_of_src(int s) {
     return -1;
 }
 
-static void draw_library(void) {
+/* ------------------------------------------------------------- fonts */
+static TTF_Font *open_font(const char *path, int size, int style) {
+    TTF_Font *f = TTF_OpenFont(path, size);
+    if (f && style) TTF_SetFontStyle(f, style);
+    return f;
+}
+
+static void apply_text_size(void) {
+    static const int bs[3] = {14, 16, 20}, ts[3] = {20, 24, 28}, cs[3] = {18, 20, 24};
+    items_clear();
+    if (fTitle) TTF_CloseFont(fTitle);
+    if (fBody) TTF_CloseFont(fBody);
+    if (fCmd) TTF_CloseFont(fCmd);
+    if (fLink) TTF_CloseFont(fLink);
+    fTitle = open_font("fonts/FreeMonoBold.ttf", ts[cfg.textSize], 0);
+    fBody = open_font("fonts/FreeMonoBold.ttf", bs[cfg.textSize], 0);
+    fCmd = open_font("fonts/FreeMono.ttf", cs[cfg.textSize], 0);
+    fLink = open_font("fonts/FreeMono.ttf", cs[cfg.textSize], TTF_STYLE_UNDERLINE);
+    rebuild_layout();
+}
+
+/* ------------------------------------------------------------- main menu */
+static void add_mi(int t, int a) { if (nMenu < 48) { menu[nMenu].type = t; menu[nMenu].a = a; nMenu++; } }
+
+static void build_menu(void) {
+    nMenu = 0;
+    add_mi(MI_SRC, 4);                       /* Homestuck, big */
+    add_mi(MI_HEAD, 0);
+    static const int adv[] = {3, 2, 1, 0, 5};
+    for (int i = 0; i < 5; i++) add_mi(MI_SRC, adv[i]);
+    add_mi(MI_HEAD, 1);
+    for (int c = 1; c < nCats; c++) {
+        if (cats[c].n == 1) add_mi(MI_SRC, cats[c].first); else add_mi(MI_CAT, c);
+    }
+    add_mi(MI_HEAD, 2);
+    add_mi(MI_ACT, ACT_GOTO);
+    add_mi(MI_ACT, ACT_SETTINGS);
+    add_mi(MI_ACT, ACT_CONTROLS);
+    selMenu = 0;
+    menuScroll = 0;
+}
+
+static int mi_height(int i) {
+    const MItem *m = &menu[i];
+    return m->type == MI_HEAD ? 28 : (m->type == MI_SRC && m->a == 4) ? 88 : 50;
+}
+
+#define MENU_TOP (TB + 44)
+#define MENU_H (VIEW_H - 44 - 30)
+
+static void menu_keep_visible(void) {
+    int y = 0;
+    for (int i = 0; i < selMenu; i++) y += mi_height(i);
+    int h = mi_height(selMenu);
+    if (selMenu > 0 && menu[selMenu - 1].type == MI_HEAD) y -= mi_height(selMenu - 1);
+    if (selMenu == 1 || y < menuScroll) menuScroll = y;
+    if (y + h > menuScroll + MENU_H) menuScroll = y + h - MENU_H;
+    if (menuScroll < 0) menuScroll = 0;
+}
+
+static void menu_move(int dir) {
+    int n = selMenu + dir;
+    while (n >= 0 && n < nMenu && menu[n].type == MI_HEAD) n += dir;
+    if (n >= 0 && n < nMenu) selMenu = n;
+    menu_keep_visible();
+}
+
+static void mi_texts(const MItem *m, char *name, size_t nn, char *sub, size_t ns) {
+    sub[0] = 0;
+    if (m->type == MI_SRC) {
+        const Source *s = &srcs[m->a];
+        const char *bm = bm_get(s->id);
+        snprintf(name, nn, "%s", s->name);
+        if (s->kind == SK_STORY) {
+            if (m->a == 4) snprintf(name, nn, "%s", bm ? "Continue Homestuck" : "Begin Homestuck");
+            if (bm) snprintf(sub, ns, m->a == 4 ? "Resume at page %s" : "resume: page %s", bm);
+            else snprintf(sub, ns, m->a == 4 ? "Start from the beginning (April 2009)" : "not started");
+        } else if (bm) snprintf(sub, ns, "resume: page %d", atoi(bm) + 1);
+        else snprintf(sub, ns, "not started");
+    } else if (m->type == MI_CAT) {
+        snprintf(name, nn, "%s", cats[m->a].name);
+        snprintf(sub, ns, "%d %s", cats[m->a].n, cats[m->a].n == 1 ? "entry" : "entries");
+    } else {
+        const char *nm[] = {"Go to page...", "Settings", "Controls"};
+        const char *sb[] = {"Jump to any page number", "Image size, text size, Flash autoplay, pesterlogs", "Button help"};
+        snprintf(name, nn, "%s", nm[m->a]);
+        snprintf(sub, ns, "%s", sb[m->a]);
+    }
+}
+
+static void draw_menu(void) {
     fill(C_BG, 0, 0, SCR_W, SCR_H);
     fill(C_PANEL, PNL_X, TB, PNL_W, VIEW_H);
     fill(C_COL, COL_X, TB + COL_TOP, COL_W, VIEW_H - COL_TOP);
@@ -1548,52 +1816,160 @@ static void draw_library(void) {
         draw_center(fFoot, loadError, top + 92, C_GREY);
         draw_center(fFoot, "Put the Asset Pack folder (the one containing 'archive') at:", top + 130, C_BLACK);
         draw_center(fFoot, "<port folder>/assets   or write its path into assetpack.txt", top + 152, C_GREY);
-        draw_center(fFoot, "Start: quit", SCR_H - 30, C_GREY);
+        draw_center(fFoot, "Select+Start: quit", SCR_H - 30, C_GREY);
         return;
     }
-    char head[120];
-    snprintf(head, sizeof head, "%s", libLevel == 0 ? "MSPA Reader" : cats[selCat].name);
-    draw_center(fTitle, head, top + 10, C_BLACK);
-    int line = TTF_FontLineSkip(fMenu) + 16;
-    if (libLevel == 0) {
-        for (int i = 0; i < nCats; i++) {
-            int y = top + 54 + i * line;
-            bool sel = i == selCat;
-            if (sel) fill(C_HILITE, COL_X + 6, y - 4, COL_W - 12, line - 2);
-            draw_str(fMenu, sel ? "> " : "  ", COL_X + PAD, y, C_BLACK);
-            draw_str(sel ? fLink : fMenu, cats[i].name, COL_X + PAD + 26, y, sel ? C_LINK : C_BLACK);
-            char b[48];
-            snprintf(b, sizeof b, "%d %s", cats[i].n, cats[i].n == 1 ? "entry" : "entries");
-            draw_str(fFoot, b, COL_X + PAD + 26, y + TTF_FontLineSkip(fMenu) - 2, C_GREY);
+    draw_center(fTitle, "MSPA Reader", top + 8, C_BLACK);
+    SDL_Rect clip = {COL_X, MENU_TOP, COL_W, MENU_H};
+    SDL_RenderSetClipRect(ren, &clip);
+    int y = MENU_TOP - menuScroll;
+    for (int i = 0; i < nMenu; i++) {
+        const MItem *m = &menu[i];
+        int h = mi_height(i);
+        if (y + h < MENU_TOP || y > MENU_TOP + MENU_H) { y += h; continue; }
+        if (m->type == MI_HEAD) {
+            const char *hd[] = {"MORE ADVENTURES", "COMICS", "TOOLS"};
+            draw_str(fFoot, hd[m->a], COL_X + PAD, y + 8, C_GREY);
+            fill(C_PANEL, COL_X + PAD, y + 24, COL_W - 2 * PAD, 1);
+            y += h;
+            continue;
         }
-        draw_center(fFoot, "A: open  |  B: back to page  |  Select: close tab  |  Start: quit", SCR_H - 28, C_GREY);
-    } else {
-        int rows = (VIEW_H - 100) / line;
-        if (rows < 3) rows = 3;
-        int first = selEnt - rows / 2;
-        if (first + rows > cats[selCat].n) first = cats[selCat].n - rows;
-        if (first < 0) first = 0;
-        for (int r = 0; r < rows && first + r < cats[selCat].n; r++) {
-            int e = first + r, si = cats[selCat].first + e, y = top + 50 + r * line;
-            bool sel = e == selEnt;
-            if (sel) fill(C_HILITE, COL_X + 6, y - 4, COL_W - 12, line - 2);
-            char nm[200];
-            fit_text(sel ? fLink : fMenu, srcs[si].name, COL_W - 2 * PAD - 30, nm, sizeof nm);
-            draw_str(fMenu, sel ? "> " : "  ", COL_X + PAD, y, C_BLACK);
-            draw_str(sel ? fLink : fMenu, nm, COL_X + PAD + 26, y, sel ? C_LINK : C_BLACK);
-            const char *bm = bm_get(srcs[si].id);
-            char b[80];
-            if (bm && srcs[si].kind == SK_STORY) snprintf(b, sizeof b, "resume: page %s", bm);
-            else if (bm) snprintf(b, sizeof b, "resume: page %d", atoi(bm) + 1);
-            else snprintf(b, sizeof b, "not started");
-            draw_str(fFoot, b, COL_X + PAD + 26, y + TTF_FontLineSkip(fMenu) - 2, C_GREY);
-        }
-        draw_center(fFoot, "A: open here | Y: new tab | B: back | L1/R1: page | Select: close tab", SCR_H - 28, C_GREY);
+        bool sel = i == selMenu, big = m->type == MI_SRC && m->a == 4;
+        char name[160], sub[160], fit[200];
+        mi_texts(m, name, sizeof name, sub, sizeof sub);
+        if (sel) fill(C_HILITE, COL_X + 6, y + 2, COL_W - 12, h - 4);
+        else if (big) fill(C_WHITE, COL_X + 6, y + 2, COL_W - 12, h - 4);
+        TTF_Font *nf = big ? fTitle : (sel ? fLink : fMenu);
+        fit_text(nf, name, COL_W - 2 * PAD - 30, fit, sizeof fit);
+        int ty = big ? y + 12 : y + 5;
+        draw_str(nf, fit, COL_X + PAD + (big ? 6 : 26), ty, (sel || big) ? C_LINK : C_BLACK);
+        if (!big) draw_str(fMenu, sel ? "> " : "  ", COL_X + PAD, ty, C_BLACK);
+        fit_text(fFoot, sub, COL_W - 2 * PAD - 30, fit, sizeof fit);
+        draw_str(fFoot, fit, COL_X + PAD + (big ? 6 : 26), big ? y + 52 : y + 30, C_GREY);
+        y += h;
     }
+    SDL_RenderSetClipRect(ren, NULL);
+    draw_center(fFoot, "A: open  |  Y: open in new tab  |  R3/Start: close tab  |  L2/R2: tabs  |  Select+Start: quit", SCR_H - 24, C_GREY);
 }
 
+static void draw_category(void) {
+    fill(C_BG, 0, 0, SCR_W, SCR_H);
+    fill(C_PANEL, PNL_X, TB, PNL_W, VIEW_H);
+    fill(C_COL, COL_X, TB + COL_TOP, COL_W, VIEW_H - COL_TOP);
+    int top = TB + COL_TOP;
+    draw_center(fTitle, cats[selCat].name, top + 8, C_BLACK);
+    int line = TTF_FontLineSkip(fMenu) + 16;
+    int rows = (VIEW_H - 110) / line;
+    if (rows < 3) rows = 3;
+    int first = selEnt - rows / 2;
+    if (first + rows > cats[selCat].n) first = cats[selCat].n - rows;
+    if (first < 0) first = 0;
+    for (int r = 0; r < rows && first + r < cats[selCat].n; r++) {
+        int e = first + r, si = cats[selCat].first + e, y = top + 50 + r * line;
+        bool sel = e == selEnt;
+        if (sel) fill(C_HILITE, COL_X + 6, y - 4, COL_W - 12, line - 2);
+        char nm[200];
+        fit_text(sel ? fLink : fMenu, srcs[si].name, COL_W - 2 * PAD - 30, nm, sizeof nm);
+        draw_str(fMenu, sel ? "> " : "  ", COL_X + PAD, y, C_BLACK);
+        draw_str(sel ? fLink : fMenu, nm, COL_X + PAD + 26, y, sel ? C_LINK : C_BLACK);
+        const char *bm = bm_get(srcs[si].id);
+        char b[80];
+        if (bm) snprintf(b, sizeof b, "resume: page %d", atoi(bm) + 1);
+        else snprintf(b, sizeof b, "not started");
+        draw_str(fFoot, b, COL_X + PAD + 26, y + TTF_FontLineSkip(fMenu) - 2, C_GREY);
+    }
+    draw_center(fFoot, "A: open here  |  Y: new tab  |  B: back  |  L1/R1: page up/down", SCR_H - 24, C_GREY);
+}
+
+static const char *img_label(char *buf, size_t n) {
+    if (cfg.imgPct >= 999) snprintf(buf, n, "Fit width");
+    else snprintf(buf, n, "%d%%", cfg.imgPct);
+    return buf;
+}
+
+static void draw_settings(void) {
+    fill(C_BG, 0, 0, SCR_W, SCR_H);
+    fill(C_PANEL, PNL_X, TB, PNL_W, VIEW_H);
+    fill(C_COL, COL_X, TB + COL_TOP, COL_W, VIEW_H - COL_TOP);
+    int top = TB + COL_TOP;
+    draw_center(fTitle, "Settings", top + 8, C_BLACK);
+    char v[7][48], ib[24];
+    static const char *tsz[] = {"Small", "Medium", "Large"};
+    snprintf(v[0], 48, "< %s >", img_label(ib, sizeof ib));
+    snprintf(v[1], 48, "< %s >", tsz[cfg.textSize]);
+    snprintf(v[2], 48, "< %s >", cfg.autoFlash ? "On" : "Off");
+    snprintf(v[3], 48, "< %s >", cfg.collapseLogs ? "Collapsed" : "Shown");
+    snprintf(v[4], 48, "< %s >", cfg.swapAB ? "On" : "Off");
+    snprintf(v[5], 48, "A: clear");
+    v[6][0] = 0;
+    static const char *nm[] = {"Image size", "Text size", "Auto-play Flash pages", "Pesterlogs & other logs", "Swap A/B buttons", "Clear read history (purple links)", "Back"};
+    static const char *ds[] = {"How big page art is drawn. Smaller = more text visible without scrolling.",
+                               "Page text size.", "Start a page's Flash automatically when you arrive on it.",
+                               "Start logs hidden behind a Show button (Y), like the website.",
+                               "For controllers whose A/B are labelled the other way round.",
+                               "Forget which pages you've read.", ""};
+    for (int i = 0; i < 7; i++) {
+        int y = top + 52 + i * 44;
+        bool sel = i == setSel;
+        if (sel) fill(C_HILITE, COL_X + 6, y - 4, COL_W - 12, 42);
+        draw_str(sel ? fLink : fMenu, nm[i], COL_X + PAD, y, sel ? C_LINK : C_BLACK);
+        draw_right(fMenu, v[i], COL_X + COL_W - PAD, y, C_BLACK);
+    }
+    if (ds[setSel][0]) {
+        char fit[260];
+        fit_text(fFoot, ds[setSel], COL_W - 2 * PAD, fit, sizeof fit);
+        draw_str(fFoot, fit, COL_X + PAD, top + 52 + 7 * 44 + 4, C_GREY);
+    }
+    draw_center(fFoot, "Up/Down: choose  |  Left/Right or A: change  |  B: back", SCR_H - 24, C_GREY);
+}
+
+static void draw_controls(void) {
+    fill(C_BG, 0, 0, SCR_W, SCR_H);
+    fill(C_PANEL, PNL_X, TB, PNL_W, VIEW_H);
+    fill(C_COL, COL_X, TB + COL_TOP, COL_W, VIEW_H - COL_TOP);
+    int top = TB + COL_TOP;
+    draw_center(fTitle, "Controls", top + 4, C_BLACK);
+    static const char *L[][2] = {
+        {"READING", ""},
+        {"A", "Next page / follow chosen link"},
+        {"B", "Back"},
+        {"X", "Main menu"},
+        {"Y", "Play Flash/video; else show/hide log"},
+        {"L1 / R1", "Jump 10 pages back / forward"},
+        {"L2 / R2", "Previous / next tab"},
+        {"Up / Down", "Scroll (right stick too)"},
+        {"Left / Right", "Pick a choice on branching pages"},
+        {"L3 or Start", "Links on this page"},
+        {"R3", "Go to a page number"},
+        {"MENU", ""},
+        {"A / Y", "Open here / open in a new tab"},
+        {"R3 or Start", "Close the current tab"},
+        {"FLASH (Ruffle)", ""},
+        {"Select+Start", "Quit the flash (and the game)"},
+        {"Select+X", "Mouse mode: D-pad moves, Y clicks"},
+    };
+    int y = top + 40;
+    for (int i = 0; i < (int)(sizeof L / sizeof L[0]); i++) {
+        if (!L[i][1][0]) { y += 4; draw_str(fCtl, L[i][0], COL_X + PAD, y, C_GREY); y += TTF_FontLineSkip(fCtl) + 1; continue; }
+        draw_str(fCtl, L[i][0], COL_X + PAD, y, C_BLACK);
+        draw_str(fCtl, L[i][1], COL_X + PAD + 150, y, C_BLACK);
+        y += TTF_FontLineSkip(fCtl);
+    }
+    draw_center(fFoot, "B: back", SCR_H - 24, C_GREY);
+}
+
+static void draw_library(void) {
+    if (libLevel == 1) draw_category();
+    else if (libLevel == 2) draw_settings();
+    else if (libLevel == 3) draw_controls();
+    else draw_menu();
+}
+
+/* ------------------------------------------------------------- page view */
+static int max_scroll_(void) { return pageH > VIEW_H ? pageH - VIEW_H : 0; }
+
 static void draw_page(void) {
-    int ms = max_scroll();
+    int ms = max_scroll_();
     if (scrollY > ms) scrollY = ms;
     if (scrollY < 0) scrollY = 0;
     int oy = TB - scrollY;
@@ -1664,7 +2040,8 @@ static void draw_links(void) {
         const Link *l = &links[i];
         snprintf(text, sizeof text, "[%s] %s", link_tag(l), l->label[0] ? l->label : (l->target[0] ? l->target : l->url));
         fit_text(fBody, text, pw - 28, fit, sizeof fit);
-        draw_str(fBody, fit, px + 12, y, l->kind == LK_WEB ? C_GREY : (sel ? C_LINK : C_BLACK));
+        SDL_Color col = l->kind == LK_WEB ? C_GREY : (l->kind == LK_PAGE && is_visited(0, l->target)) ? C_VISITED : (sel ? C_LINK : C_BLACK);
+        draw_str(fBody, fit, px + 12, y, col);
     }
     char url[320];
     fit_text(fFoot, links[selLink].url, pw - 24, url, sizeof url);
@@ -1672,6 +2049,25 @@ static void draw_links(void) {
     draw_str(fFoot, links[selLink].kind == LK_WEB ? "Web links can't be opened on this device   |   B: close"
                                                   : "A: open in new tab   |   Y: open in this tab   |   B: close",
              px + 12, py + ph - 28, C_BLACK);
+}
+
+static void draw_goto(void) {
+    fill_a((SDL_Color){0, 0, 0, 255}, 170, 0, TB, SCR_W, VIEW_H);
+    int pw = 400, ph = 210, px = (SCR_W - pw) / 2, py = TB + (VIEW_H - ph) / 2;
+    fill(C_COL, px, py, pw, ph);
+    draw_center(fBody, "Go to page", py + 12, C_BLACK);
+    int bw = 44, gap = 8, tot = gotoWidth * bw + (gotoWidth - 1) * gap, x0 = (SCR_W - tot) / 2, by = py + 60;
+    for (int i = 0; i < gotoWidth; i++) {
+        int x = x0 + i * (bw + gap);
+        fill(i == gotoPos ? C_HILITE : C_WHITE, x, by, bw, 62);
+        fill(i == gotoPos ? C_LINK : C_PANEL, x, by + 60, bw, 3);
+        char d[2] = {(char)('0' + gotoDigits[i]), 0};
+        int w = 0;
+        TTF_SizeUTF8(fTitle, d, &w, NULL);
+        draw_str(fTitle, d, x + (bw - w) / 2, by + 14, C_BLACK);
+        if (i == gotoPos) { draw_str(fFoot, "^", x + bw / 2 - 3, by - 14, C_LINK); draw_str(fFoot, "v", x + bw / 2 - 3, by + 66, C_LINK); }
+    }
+    draw_center(fFoot, "Up/Down: digit  |  Left/Right: move  |  A: go  |  B: cancel", py + ph - 30, C_GREY);
 }
 
 static void draw_toast(void) {
@@ -1699,47 +2095,104 @@ static void animate(bool *dirty) {
     }
 }
 
-/* ------------------------------------------------------------- main */
-static TTF_Font *open_font(const char *path, int size, int style) {
-    TTF_Font *f = TTF_OpenFont(path, size);
-    if (f && style) TTF_SetFontStyle(f, style);
-    return f;
-}
-
+/* ------------------------------------------------------------- input */
 static void open_library(void) {
     save_tabs();
     menuMode = true;
     overlay = 0;
-    if (nTabs > 0) {
-        int c = cat_of_src(CT.src);
-        if (c >= 0) { selCat = c; selEnt = CT.src - cats[c].first; libLevel = 1; return; }
-    }
     libLevel = 0;
+    if (nTabs > 0) {
+        for (int i = 0; i < nMenu; i++) {
+            if (menu[i].type == MI_SRC && menu[i].a == CT.src) { selMenu = i; break; }
+            if (menu[i].type == MI_CAT) {
+                int c = menu[i].a;
+                if (CT.src >= cats[c].first && CT.src < cats[c].first + cats[c].n) { selMenu = i; break; }
+            }
+        }
+    }
+    menu_keep_visible();
 }
 
-static void handle_library(int b) {
-    if (b == SDL_CONTROLLER_BUTTON_BACK) { if (nTabs > 0) tab_close_current(); return; }
+static void settings_adjust(int dir) {
+    switch (setSel) {
+    case 0:
+        if (cfg.imgPct >= 999) { if (dir < 0) cfg.imgPct = 150; }
+        else { cfg.imgPct += dir * 5; if (cfg.imgPct < 30) cfg.imgPct = 30; if (cfg.imgPct > 150) cfg.imgPct = 999; }
+        break;
+    case 1: cfg.textSize += dir; if (cfg.textSize < 0) cfg.textSize = 0; if (cfg.textSize > 2) cfg.textSize = 2; break;
+    case 2: cfg.autoFlash = !cfg.autoFlash; break;
+    case 3: cfg.collapseLogs = !cfg.collapseLogs; break;
+    case 4: cfg.swapAB = !cfg.swapAB; break;
+    case 5: if (dir == 0) { visited_clear(); toast("Read history cleared"); } return;
+    default: return;
+    }
+    settings_save();
+    if (setSel == 1) apply_text_size();
+    else if (setSel == 3) { logOpen = !cfg.collapseLogs; rebuild_layout(); }
+    else rebuild_layout();
+}
+
+static void handle_menu(int b) {
     if (loadError[0]) return;
-    if (libLevel == 0) {
-        if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && selCat > 0) selCat--;
-        if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && selCat + 1 < nCats) selCat++;
-        if (b == SDL_CONTROLLER_BUTTON_A) { libLevel = 1; selEnt = 0; }
-        if ((b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_X) && nTabs > 0) menuMode = false;
-    } else {
-        int n = cats[selCat].n;
-        if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && selEnt > 0) selEnt--;
-        if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && selEnt + 1 < n) selEnt++;
-        if (b == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) selEnt = selEnt > 7 ? selEnt - 8 : 0;
-        if (b == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) selEnt = selEnt + 8 < n ? selEnt + 8 : n - 1;
-        if (b == SDL_CONTROLLER_BUTTON_A) lib_open(cats[selCat].first + selEnt, false);
-        if (b == SDL_CONTROLLER_BUTTON_Y) lib_open(cats[selCat].first + selEnt, true);
-        if (b == SDL_CONTROLLER_BUTTON_B) libLevel = 0;
-        if (b == SDL_CONTROLLER_BUTTON_X && nTabs > 0) menuMode = false;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_UP) menu_move(-1);
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) menu_move(1);
+    if (b == SDL_CONTROLLER_BUTTON_RIGHTSTICK || b == SDL_CONTROLLER_BUTTON_START) { if (nTabs > 0) tab_close_current(); return; }
+    if ((b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_X) && nTabs > 0) { menuMode = false; return; }
+    if (b != SDL_CONTROLLER_BUTTON_A && b != SDL_CONTROLLER_BUTTON_Y) return;
+    const MItem *m = &menu[selMenu];
+    bool newTab = b == SDL_CONTROLLER_BUTTON_Y;
+    if (m->type == MI_SRC) lib_open(m->a, newTab);
+    else if (m->type == MI_CAT) {
+        selCat = m->a;
+        selEnt = 0;
+        if (nTabs > 0 && CT.src >= cats[selCat].first && CT.src < cats[selCat].first + cats[selCat].n) selEnt = CT.src - cats[selCat].first;
+        libLevel = 1;
+    } else if (m->type == MI_ACT) {
+        if (m->a == ACT_GOTO) goto_dialog_open();
+        else if (m->a == ACT_SETTINGS) { libLevel = 2; setSel = 0; }
+        else libLevel = 3;
+    }
+}
+
+static void handle_category(int b) {
+    int n = cats[selCat].n;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && selEnt > 0) selEnt--;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && selEnt + 1 < n) selEnt++;
+    if (b == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) selEnt = selEnt > 7 ? selEnt - 8 : 0;
+    if (b == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) selEnt = selEnt + 8 < n ? selEnt + 8 : n - 1;
+    if (b == SDL_CONTROLLER_BUTTON_A) lib_open(cats[selCat].first + selEnt, false);
+    if (b == SDL_CONTROLLER_BUTTON_Y) lib_open(cats[selCat].first + selEnt, true);
+    if (b == SDL_CONTROLLER_BUTTON_B) libLevel = 0;
+    if (b == SDL_CONTROLLER_BUTTON_X && nTabs > 0) menuMode = false;
+    if ((b == SDL_CONTROLLER_BUTTON_RIGHTSTICK || b == SDL_CONTROLLER_BUTTON_START) && nTabs > 0) tab_close_current();
+}
+
+static void handle_settings(int b) {
+    if (b == SDL_CONTROLLER_BUTTON_B || (b == SDL_CONTROLLER_BUTTON_A && setSel == 6)) { libLevel = 0; return; }
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && setSel > 0) setSel--;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && setSel < 6) setSel++;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT) settings_adjust(-1);
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) settings_adjust(1);
+    if (b == SDL_CONTROLLER_BUTTON_A) settings_adjust(setSel == 5 ? 0 : 1);
+}
+
+static void handle_goto(int b) {
+    int *d = &gotoDigits[gotoPos];
+    if (b == SDL_CONTROLLER_BUTTON_B) { overlay = 0; return; }
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_UP) *d = (*d + 1) % 10;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) *d = (*d + 9) % 10;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT && gotoPos > 0) gotoPos--;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT && gotoPos + 1 < gotoWidth) gotoPos++;
+    if (b == SDL_CONTROLLER_BUTTON_A) {
+        int n = 0;
+        for (int i = 0; i < gotoWidth; i++) n = n * 10 + gotoDigits[i];
+        overlay = 0;
+        goto_number(n);
     }
 }
 
 static void handle_links(int b) {
-    if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_BACK) { overlay = 0; return; }
+    if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_LEFTSTICK || b == SDL_CONTROLLER_BUTTON_START) { overlay = 0; return; }
     if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && selLink > 0) selLink--;
     if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && selLink + 1 < nLinks) selLink++;
     if (b == SDL_CONTROLLER_BUTTON_A) { int i = selLink; overlay = 0; open_link(i, true); }
@@ -1756,34 +2209,59 @@ static void handle_reading(int b) {
     if (b == SDL_CONTROLLER_BUTTON_Y) {
         if (has_kind(1)) play_external(1);
         else if (has_kind(3)) play_external(3);
+        else if (logPresent) { logOpen = !logOpen; rebuild_layout(); }
     }
     if (b == SDL_CONTROLLER_BUTTON_X) open_library();
-    if (b == SDL_CONTROLLER_BUTTON_BACK) {
+    if (b == SDL_CONTROLLER_BUTTON_LEFTSTICK || b == SDL_CONTROLLER_BUTTON_START) {
         if (nLinks > 0) { overlay = 1; selLink = 0; }
         else toast("No links on this page");
     }
+    if (b == SDL_CONTROLLER_BUTTON_RIGHTSTICK) goto_dialog_open();
+}
+
+/* ------------------------------------------------------------- startup */
+static bool has_pack(const char *p) {
+    char t[700];
+    snprintf(t, sizeof t, "%s/archive/data/mspa.json", p);
+    return file_exists(t);
+}
+
+static void find_assets(const char *arg) {
+    static char fromFile[512];
+    const char *cand[16];
+    int n = 0;
+    if (arg && *arg) cand[n++] = arg;
+    const char *env = getenv("MSPA_ASSETS");
+    if (env && *env) cand[n++] = env;
+    char *s = (char *)read_file("assetpack.txt", NULL);
+    if (s) { s[strcspn(s, "\r\n")] = 0; snprintf(fromFile, sizeof fromFile, "%s", s); free(s); if (fromFile[0]) cand[n++] = fromFile; }
+    cand[n++] = "assets";
+    cand[n++] = "/storage/roms/mspa_assets";
+    cand[n++] = "/storage/games-external/mspa_assets";
+    cand[n++] = "/storage/games-external/roms/mspa_assets";
+    cand[n++] = "/roms/mspa_assets";
+    cand[n++] = "/roms2/mspa_assets";
+    cand[n++] = "/mnt/sdcard/mspa_assets";
+    snprintf(assets, sizeof assets, "%s", cand[0]);
+    for (int i = 0; i < n; i++) if (has_pack(cand[i])) { snprintf(assets, sizeof assets, "%s", cand[i]); break; }
+    size_t al = strlen(assets);
+    while (al > 1 && assets[al - 1] == '/') assets[--al] = 0;
 }
 
 int main(int argc, char **argv) {
-    const char *env = getenv("MSPA_ASSETS");
-    if (argc > 1) snprintf(assets, sizeof assets, "%s", argv[1]);
-    else if (env && *env) snprintf(assets, sizeof assets, "%s", env);
-    else snprintf(assets, sizeof assets, "assets");
-    size_t al = strlen(assets);
-    while (al > 1 && assets[al - 1] == '/') assets[--al] = 0;
-    swapAB = getenv("MSPA_SWAP_AB") && getenv("MSPA_SWAP_AB")[0] == '1';
     mkdir("conf", 0755);
+    find_assets(argc > 1 ? argv[1] : NULL);
+    settings_load();
+    visited_load();
 
     if (SDL_Init(0) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
     TTF_Init();
-    fTitle = open_font("fonts/FreeMonoBold.ttf", 24, 0);
-    fBody = open_font("fonts/FreeMonoBold.ttf", 16, 0);
-    fCmd = open_font("fonts/FreeMono.ttf", 20, 0);
-    fLink = open_font("fonts/FreeMono.ttf", 20, TTF_STYLE_UNDERLINE);
+    apply_text_size();
     fMenu = open_font("fonts/FreeMono.ttf", 22, 0);
     fFoot = open_font("fonts/LiberationSans-Bold.ttf", 12, 0);
     fFootU = open_font("fonts/LiberationSans-Bold.ttf", 12, TTF_STYLE_UNDERLINE);
-    if (!fTitle || !fBody || !fCmd || !fLink || !fMenu || !fFoot || !fFootU) {
+    fCtl = open_font("fonts/FreeMonoBold.ttf", 14, 0);
+    if (!fTitle || !fBody || !fCmd || !fLink || !fMenu || !fFoot || !fFootU || !fCtl) {
         fprintf(stderr, "font load failed: %s\n", TTF_GetError());
         return 1;
     }
@@ -1793,7 +2271,7 @@ int main(int argc, char **argv) {
     draw_center(fTitle, "Loading...", SCR_H / 2 - 12, C_CARDTXT);
     SDL_RenderPresent(ren);
 
-    if (load_data()) { bm_load(); restore_tabs(); }
+    if (load_data()) { bm_load(); build_menu(); restore_tabs(); }
 
     bool running = true, dirty = true, trigL = false, trigR = false;
     while (running) {
@@ -1807,26 +2285,32 @@ int main(int argc, char **argv) {
                 if (l || r) {
                     bool on = e.caxis.value > 16000;
                     bool *st = l ? &trigL : &trigR;
-                    if (on && !*st && !menuMode && !overlay && nTabs > 0) { tab_switch(l ? -1 : 1); dirty = true; }
-                    if (on && !*st && menuMode && nTabs > 1) { /* switch tab straight from the library */
-                        CT.scroll = scrollY; tab_show((curTab + (l ? -1 : 1) + nTabs) % nTabs); dirty = true;
-                    }
+                    if (on && !*st && !overlay && nTabs > 1) { CT.scroll = scrollY; tab_show((curTab + (l ? -1 : 1) + nTabs) % nTabs); dirty = true; }
+                    else if (on && !*st && nTabs == 1) toast("Only one tab open");
                     *st = on;
                 }
             }
             if (e.type != SDL_CONTROLLERBUTTONDOWN && e.type != SDL_CONTROLLERBUTTONUP) continue;
             int b = e.cbutton.button;
             bool down = e.type == SDL_CONTROLLERBUTTONDOWN;
-            if (swapAB) {
+            if (cfg.swapAB) {
                 if (b == SDL_CONTROLLER_BUTTON_A) b = SDL_CONTROLLER_BUTTON_B;
                 else if (b == SDL_CONTROLLER_BUTTON_B) b = SDL_CONTROLLER_BUTTON_A;
             }
+            if (b == SDL_CONTROLLER_BUTTON_BACK) selectHeld = down;
             if (b == SDL_CONTROLLER_BUTTON_DPAD_UP) dpadDir = down ? -1 : (dpadDir == -1 ? 0 : dpadDir);
             if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) dpadDir = down ? 1 : (dpadDir == 1 ? 0 : dpadDir);
             if (!down) continue;
-            if (b == SDL_CONTROLLER_BUTTON_START) { running = false; continue; }
-            if (menuMode) handle_library(b);
-            else if (overlay) handle_links(b);
+            if (b == SDL_CONTROLLER_BUTTON_START && selectHeld) { running = false; continue; }   /* Select+Start = quit */
+            if (b == SDL_CONTROLLER_BUTTON_BACK) continue;
+            if (menuMode) {
+                if (libLevel == 0) handle_menu(b);
+                else if (libLevel == 1) handle_category(b);
+                else if (libLevel == 2) handle_settings(b);
+                else if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_A) libLevel = 0;
+            }
+            else if (overlay == 1) handle_links(b);
+            else if (overlay == 2) handle_goto(b);
             else handle_reading(b);
             dirty = true;
         }
@@ -1834,21 +2318,26 @@ int main(int argc, char **argv) {
             int dir = dpadDir ? dpadDir : stickDir;
             if (dir) {
                 scrollY += dir * 8;
-                int ms = max_scroll();
+                int ms = max_scroll_();
                 if (scrollY < 0) scrollY = 0;
                 if (scrollY > ms) scrollY = ms;
                 dirty = true;
             }
             animate(&dirty);
         }
+        if (menuMode && libLevel == 0 && (dpadDir || stickDir) && false) dirty = true;
         if (toastUntil && SDL_GetTicks() < toastUntil + 50) dirty = true;
         if (dirty) {
             if (menuMode) draw_library();
-            else { draw_page(); if (overlay) draw_links(); }
+            else { draw_page(); if (overlay == 1) draw_links(); else if (overlay == 2) draw_goto(); }
             draw_tabbar();
             draw_toast();
             SDL_RenderPresent(ren);
             dirty = false;
+        }
+        if (autoRequest) {                       /* Flash autoplay: page was shown, now run the flash */
+            autoRequest = false;
+            if (!menuMode && !overlay && has_kind(1)) { play_external(1); dirty = true; }
         }
         SDL_Delay(8);
     }
