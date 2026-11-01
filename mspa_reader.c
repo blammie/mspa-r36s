@@ -9,21 +9,21 @@ Tabs (L2/R2), links on pages (Select), inline images, GIF/PNG/JPEG, Flash via Ru
 (run_flash.sh) and video via run_video.sh.
 Usage: mspa_reader [assets_dir]     (or env MSPA_ASSETS)       Env: MSPA_SWAP_AB=1
 */
-#include  <SDL.h >
-#include  <SDL_ttf.h >
-#include  <ctype.h >
-#include  <dirent.h >
-#include  <stdarg.h >
-#include  <stdbool.h >
-#include  <stdint.h >
-#include  <stdio.h >
-#include  <stdlib.h >
-#include  <string.h >
-#include  <strings.h >
-#include  <sys/stat.h >
-#include  <sys/wait.h >
-#include  <unistd.h >
-#include  <signal.h >
+#include  <SDL.h>
+#include  <SDL_ttf.h>
+#include  <ctype.h>
+#include  <dirent.h>
+#include  <stdarg.h>
+#include  <stdbool.h>
+#include  <stdint.h>
+#include  <stdio.h>
+#include  <stdlib.h>
+#include  <string.h>
+#include  <strings.h>
+#include  <sys/stat.h>
+#include  <sys/wait.h>
+#include  <unistd.h>
+#include  <signal.h>
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
