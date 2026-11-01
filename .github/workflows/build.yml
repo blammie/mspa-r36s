@@ -4,11 +4,11 @@ on:
   push:
 jobs:
   build:
-    runs-on: ubuntu-22.04-arm   # native arm64, glibc 2.35 (runs on older handheld firmwares too)
+    runs-on: ubuntu-22.04-arm   # native arm64, glibc 2.35
     steps:
       - uses: actions/checkout@v4
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y gcc make libsdl2-dev libsdl2-ttf-dev
+        run: sudo apt-get update && sudo apt-get install -y gcc make libsdl2-dev libsdl2-ttf-dev libstb-dev
       - name: Compile
         run: make
       - name: Collect binary and libraries
@@ -16,8 +16,9 @@ jobs:
           mkdir -p out/libs.aarch64
           cp mspa_reader.aarch64 out/
           ldd out/mspa_reader.aarch64
+          # only bundle SDL2_ttf and its own deps; SDL2/audio/video libs come from the device
           ldd out/mspa_reader.aarch64 | awk '/=> \//{print $3}' \
-            | grep -Ev '/(libc|libm|libdl|libpthread|librt|libgcc_s|libSDL2-2\.0|ld-linux-aarch64)\.so' \
+            | grep -E '/(libSDL2_ttf|libfreetype|libharfbuzz|libgraphite2|libglib-2|libpcre|libpng16|libbrotli|libz)' \
             | xargs -r -I{} cp -L {} out/libs.aarch64/
           ls -la out out/libs.aarch64
       - uses: actions/upload-artifact@v4
