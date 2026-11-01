@@ -1427,34 +1427,34 @@ toast( "Web link, can't open here: %.120s ", lk->url);
 
 /* --- UPDATED: Non-blocking Flash/Video launcher --- */
 static void play_external(int kind) {
-	const char *path = NULL;
-	for (int i = 0; i < nMedia; i++) if (media[i].kind == kind) { path = media[i].path; break; }
-	if (!path) return;
+    const char *path = NULL;
+    for (int i = 0; i < nMedia; i++) if (media[i].kind == kind) { path = media[i].path; break; }
+    if (!path) return;
 
-	/* Kill any existing media process before starting a new one */
-	if (flashPid > 0) {
-		kill(flashPid, SIGTERM);
-		waitpid(flashPid, NULL, 0);
-		flashPid = 0;
-	}
+    /* Kill any existing media process before starting a new one */
+    if (flashPid > 0) {
+        kill(flashPid, SIGTERM);
+        waitpid(flashPid, NULL, 0);
+        flashPid = 0;
+    }
 
-	CT.scroll = scrollY;
-	save_tabs();
+    CT.scroll = scrollY;
+    save_tabs();
 
-	pid_t pid = fork();
-	if (pid == 0) {
-		/* --- CHILD PROCESS --- */
-		setenv(kind == 1 ? "MSPA_SWF" : "MSPA_VIDEO", path, 1);
-		setenv("MSPA_FLASH_ENGINE", cfg.flashEngine ? "handheld" : "classic", 1);
-		execl("/bin/bash", "bash", kind == 1 ? "./run_flash.sh" : "./run_video.sh", (char *)NULL);
-		_exit(1); /* If execl fails */
-	} else if (pid > 0) {
-		/* --- PARENT PROCESS (Reader stays alive) --- */
-		flashPid = pid;
-		toast("Media started. Select+Start to close.");
-	} else {
-		toast("Failed to start media");
-	}
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* --- CHILD PROCESS --- */
+        setenv(kind == 1 ? "MSPA_SWF" : "MSPA_VIDEO", path, 1);
+        setenv("MSPA_FLASH_ENGINE", cfg.flashEngine ? "handheld" : "classic", 1);
+        execl("/bin/bash", "bash", kind == 1 ? "./run_flash.sh" : "./run_video.sh", (char *)NULL);
+        _exit(1); /* If execl fails */
+    } else if (pid > 0) {
+        /* --- PARENT PROCESS (Reader stays alive) --- */
+        flashPid = pid;
+        toast("Media started. Select+Start to close.");
+    } else {
+        toast("Failed to start media");
+    }
 }
 
 static void restore_tabs(void) {
@@ -2160,16 +2160,18 @@ if (SDL_Init(0) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); retur
          
          /* --- UPDATED: Select+Start logic --- */
          if (b == SDL_CONTROLLER_BUTTON_START && selectHeld) {
-             if (flashPid > 0) {
-                 kill(flashPid, SIGTERM);
-                 waitpid(flashPid, NULL, 0);
-                 flashPid = 0;
-                 toast("Media closed");
-             } else {
-                 running = false;
-             }
-             continue;
-         }
+    if (flashPid > 0) {
+        /* Kill the flash/video, but keep the reader running! */
+        kill(flashPid, SIGTERM);
+        waitpid(flashPid, NULL, 0);
+        flashPid = 0;
+        toast("Media closed");
+    } else {
+        /* No media running, actually quit the app */
+        running = false; 
+    }
+    continue;
+}
          
          if (b == SDL_CONTROLLER_BUTTON_BACK) continue;
          if (menuMode) {
@@ -2208,8 +2210,19 @@ if (SDL_Init(0) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); retur
              flashPid = 0;
          }
      }
-     
-     if (dirty) {
+    /* Check if background flash/video finished on its own */
+    if (flashPid > 0) {
+        int status;
+        pid_t res = waitpid(flashPid, &status, WNOHANG);
+        if (res != 0) {
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
+                toast("No video player found");
+            }
+            flashPid = 0;
+        }
+    }
+
+    if (dirty) {
          if (menuMode) draw_library();
          else { draw_page(); if (overlay == 1) draw_links(); else if (overlay == 2) draw_goto(); }
          draw_tabbar();
