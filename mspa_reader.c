@@ -183,8 +183,8 @@ static int libLevel, selCat, selEnt;
 static int dpadDir, stickDir;
 static char toastMsg[200];
 static uint32_t toastUntil;
-typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB; } Settings;
-static Settings cfg = {55, 1, false, true, false};   /* imgPct: 30..150, 999 = fit column width */
+typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB; int flashEngine; } Settings;
+static Settings cfg = {55, 1, false, true, false, 0};   /* flashEngine: 0 classic Ruffle, 1 Ruffle Handheld */   /* imgPct: 30..150, 999 = fit column width */
 static uint8_t *visitedBits[2];
 static bool logOpen, logPresent, autoRequest, g_noAuto, g_logs;
 static bool selectHeld;
@@ -660,8 +660,8 @@ static void page_free(Page *p) { free(p->html); p->html = NULL; p->valid = false
 static void settings_save(void) {
     FILE *f = fopen("conf/settings.txt", "w");
     if (!f) return;
-    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\n",
-            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB);
+    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nflashengine=%d\n",
+            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.flashEngine);
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -677,6 +677,7 @@ static void settings_load(void) {
         else if (sscanf(line, "autoflash=%d", &v) == 1) cfg.autoFlash = v != 0;
         else if (sscanf(line, "collapselogs=%d", &v) == 1) cfg.collapseLogs = v != 0;
         else if (sscanf(line, "swapab=%d", &v) == 1) cfg.swapAB = v != 0;
+        else if (sscanf(line, "flashengine=%d", &v) == 1) cfg.flashEngine = v ? 1 : 0;
     }
     free(s);
 }
@@ -1546,6 +1547,7 @@ static void play_external(int kind) {
     save_tabs();
     video_shutdown();
     setenv(kind == 1 ? "MSPA_SWF" : "MSPA_VIDEO", p, 1);
+    setenv("MSPA_FLASH_ENGINE", cfg.flashEngine ? "handheld" : "classic", 1);
     int rc = system(kind == 1 ? "bash ./run_flash.sh" : "bash ./run_video.sh");
     dpadDir = stickDir = 0;
     selectHeld = false;
@@ -1892,33 +1894,35 @@ static void draw_settings(void) {
     fill(C_PANEL, PNL_X, TB, PNL_W, VIEW_H);
     fill(C_COL, COL_X, TB + COL_TOP, COL_W, VIEW_H - COL_TOP);
     int top = TB + COL_TOP;
-    draw_center(fTitle, "Settings", top + 8, C_BLACK);
-    char v[7][48], ib[24];
+    draw_center(fTitle, "Settings", top + 6, C_BLACK);
+    char v[8][48], ib[24];
     static const char *tsz[] = {"Small", "Medium", "Large"};
     snprintf(v[0], 48, "< %s >", img_label(ib, sizeof ib));
     snprintf(v[1], 48, "< %s >", tsz[cfg.textSize]);
     snprintf(v[2], 48, "< %s >", cfg.autoFlash ? "On" : "Off");
-    snprintf(v[3], 48, "< %s >", cfg.collapseLogs ? "Collapsed" : "Shown");
-    snprintf(v[4], 48, "< %s >", cfg.swapAB ? "On" : "Off");
-    snprintf(v[5], 48, "A: clear");
-    v[6][0] = 0;
-    static const char *nm[] = {"Image size", "Text size", "Auto-play Flash pages", "Pesterlogs & other logs", "Swap A/B buttons", "Clear read history (purple links)", "Back"};
+    snprintf(v[3], 48, "< %s >", cfg.flashEngine ? "Ruffle Handheld" : "Classic");
+    snprintf(v[4], 48, "< %s >", cfg.collapseLogs ? "Collapsed" : "Shown");
+    snprintf(v[5], 48, "< %s >", cfg.swapAB ? "On" : "Off");
+    snprintf(v[6], 48, "A: clear");
+    v[7][0] = 0;
+    static const char *nm[] = {"Image size", "Text size", "Auto-play Flash pages", "Flash engine", "Pesterlogs & other logs", "Swap A/B buttons", "Clear read history", "Back"};
     static const char *ds[] = {"How big page art is drawn. Smaller = more text visible without scrolling.",
                                "Page text size.", "Start a page's Flash automatically when you arrive on it.",
+                               "Classic = the Ruffle build used so far. Ruffle Handheld = per-flash profiles (experimental).",
                                "Start logs hidden behind a Show button (Y), like the website.",
                                "For controllers whose A/B are labelled the other way round.",
-                               "Forget which pages you've read.", ""};
-    for (int i = 0; i < 7; i++) {
-        int y = top + 52 + i * 44;
+                               "Forget which pages you've read (purple links).", ""};
+    for (int i = 0; i < 8; i++) {
+        int y = top + 46 + i * 40;
         bool sel = i == setSel;
-        if (sel) fill(C_HILITE, COL_X + 6, y - 4, COL_W - 12, 42);
+        if (sel) fill(C_HILITE, COL_X + 6, y - 4, COL_W - 12, 38);
         draw_str(sel ? fLink : fMenu, nm[i], COL_X + PAD, y, sel ? C_LINK : C_BLACK);
         draw_right(fMenu, v[i], COL_X + COL_W - PAD, y, C_BLACK);
     }
     if (ds[setSel][0]) {
         char fit[260];
         fit_text(fFoot, ds[setSel], COL_W - 2 * PAD, fit, sizeof fit);
-        draw_str(fFoot, fit, COL_X + PAD, top + 52 + 7 * 44 + 4, C_GREY);
+        draw_str(fFoot, fit, COL_X + PAD, top + 46 + 8 * 40 + 2, C_GREY);
     }
     draw_center(fFoot, "Up/Down: choose  |  Left/Right or A: change  |  B: back", SCR_H - 24, C_GREY);
 }
@@ -2121,15 +2125,16 @@ static void settings_adjust(int dir) {
         break;
     case 1: cfg.textSize += dir; if (cfg.textSize < 0) cfg.textSize = 0; if (cfg.textSize > 2) cfg.textSize = 2; break;
     case 2: cfg.autoFlash = !cfg.autoFlash; break;
-    case 3: cfg.collapseLogs = !cfg.collapseLogs; break;
-    case 4: cfg.swapAB = !cfg.swapAB; break;
-    case 5: if (dir == 0) { visited_clear(); toast("Read history cleared"); } return;
+    case 3: cfg.flashEngine = !cfg.flashEngine; break;
+    case 4: cfg.collapseLogs = !cfg.collapseLogs; break;
+    case 5: cfg.swapAB = !cfg.swapAB; break;
+    case 6: if (dir == 0) { visited_clear(); toast("Read history cleared"); } return;
     default: return;
     }
     settings_save();
     if (setSel == 1) apply_text_size();
-    else if (setSel == 3) { logOpen = !cfg.collapseLogs; rebuild_layout(); }
-    else rebuild_layout();
+    else if (setSel == 4) { logOpen = !cfg.collapseLogs; rebuild_layout(); }
+    else if (setSel == 0) rebuild_layout();
 }
 
 static void handle_menu(int b) {
@@ -2168,12 +2173,12 @@ static void handle_category(int b) {
 }
 
 static void handle_settings(int b) {
-    if (b == SDL_CONTROLLER_BUTTON_B || (b == SDL_CONTROLLER_BUTTON_A && setSel == 6)) { libLevel = 0; return; }
+    if (b == SDL_CONTROLLER_BUTTON_B || (b == SDL_CONTROLLER_BUTTON_A && setSel == 7)) { libLevel = 0; return; }
     if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && setSel > 0) setSel--;
-    if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && setSel < 6) setSel++;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && setSel < 7) setSel++;
     if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT) settings_adjust(-1);
     if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) settings_adjust(1);
-    if (b == SDL_CONTROLLER_BUTTON_A) settings_adjust(setSel == 5 ? 0 : 1);
+    if (b == SDL_CONTROLLER_BUTTON_A) settings_adjust(setSel == 6 ? 0 : 1);
 }
 
 static void handle_goto(int b) {
@@ -2244,6 +2249,8 @@ static void find_assets(const char *arg) {
     cand[n++] = "/mnt/sdcard/mspa_assets";
     snprintf(assets, sizeof assets, "%s", cand[0]);
     for (int i = 0; i < n; i++) if (has_pack(cand[i])) { snprintf(assets, sizeof assets, "%s", cand[i]); break; }
+    char rp[4096];
+    if (realpath(assets, rp)) snprintf(assets, sizeof assets, "%s", rp);   /* always absolute: Ruffle needs it */
     size_t al = strlen(assets);
     while (al > 1 && assets[al - 1] == '/') assets[--al] = 0;
 }
