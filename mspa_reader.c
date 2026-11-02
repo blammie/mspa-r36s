@@ -261,15 +261,6 @@ static uint8_t *read_file(const char *path, size_t *n) {
     return b;
 }
 
-static void write_small(const char *path, const char *s) {
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    fputs(s, f);
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-}
-
 /* case-insensitive path resolve below `assets` (the pack may live on a case-sensitive fs) */
 static bool resolve_path(const char *rel, char *out, size_t n) {
     snprintf(out, n, "%s%s", assets, rel);
@@ -657,7 +648,7 @@ static bool src_load_page(int si, const char *key, Page *p) {
         snprintf(b, sizeof b, "%s", base_of(srcs[si].files[idx]));
         char *d = strrchr(b, '.');
         if (d) *d = 0;
-        snprintf(title, sizeof title, "%s", b);
+        snprintf(title, sizeof title, "%.200s", b);
         p->html = strdup("");
     } else {
         snprintf(p->media[0], 256, "%s", srcs[si].single);
@@ -947,11 +938,11 @@ static void classify_link(Link *lk) {
     }
     char path[300];
     url_path(u, path, sizeof path);
-    if (!strncmp(path, "/tso/", 5)) { snprintf(lk->target, sizeof lk->target, "%s", path + 5); lk->kind = LK_TSO; return; }
+    if (!strncmp(path, "/tso/", 5)) { snprintf(lk->target, sizeof lk->target, "%.250s", path + 5); lk->kind = LK_TSO; return; }
     const char *x = ext_of(path);
     if (!strcasecmp(x, "gif") || !strcasecmp(x, "png") || !strcasecmp(x, "jpg") || !strcasecmp(x, "jpeg") ||
         !strcasecmp(x, "swf") || !strcasecmp(x, "mp4")) {
-        snprintf(lk->target, sizeof lk->target, "%s", path);
+        snprintf(lk->target, sizeof lk->target, "%.250s", path);
         lk->kind = LK_ASSET;
     }
 }
@@ -1142,12 +1133,12 @@ static void media_load(Media *m) {
         m->kind = strcasecmp(ext, "swf") ? 3 : 1;
         if (!resolve_path(m->rel, m->path, sizeof m->path)) {
             m->kind = 2;
-            snprintf(m->label, sizeof m->label, "[ File missing ]<br />%s", m->rel);
+            snprintf(m->label, sizeof m->label, "[ File missing ]<br />%.200s", m->rel);
         }
         return;
     }
     if (!strcasecmp(ext, "gif") || !strcasecmp(ext, "png") || !strcasecmp(ext, "jpg") || !strcasecmp(ext, "jpeg")) {
-        if (!resolve_path(m->rel, m->path, sizeof m->path)) { m->kind = 2; snprintf(m->label, sizeof m->label, "[ Image missing ]<br />%s", m->rel); return; }
+        if (!resolve_path(m->rel, m->path, sizeof m->path)) { m->kind = 2; snprintf(m->label, sizeof m->label, "[ Image missing ]<br />%.200s", m->rel); return; }
         size_t n = 0;
         uint8_t *buf = read_file(m->path, &n);
         if (!buf) { m->kind = 2; snprintf(m->label, sizeof m->label, "[ Cannot read image ]"); return; }
@@ -1165,7 +1156,7 @@ static void media_load(Media *m) {
             free(buf);
             if (px) { m->w = w; m->h = h; m->tex = tex_from_rgba(px, w, h); stbi_image_free(px); }
         }
-        if (!m->tex) { m->kind = 2; snprintf(m->label, sizeof m->label, "[ Image too large or unreadable ]<br />%s", m->rel); }
+        if (!m->tex) { m->kind = 2; snprintf(m->label, sizeof m->label, "[ Image too large or unreadable ]<br />%.200s", m->rel); }
         return;
     }
     m->kind = 2;
@@ -1264,7 +1255,7 @@ static void place_inline(const char *url, int boxW, int *y) {
     if (strcasecmp(x, "gif") && strcasecmp(x, "png") && strcasecmp(x, "jpg") && strcasecmp(x, "jpeg")) return;
     Media *m = &media[nMedia];
     memset(m, 0, sizeof *m);
-    snprintf(m->rel, sizeof m->rel, "%s", path);
+    snprintf(m->rel, sizeof m->rel, "%.250s", path);
     media_load(m);
     if (m->kind != 0 || !m->tex) {
         if (m->tex) SDL_DestroyTexture(m->tex);
@@ -1659,12 +1650,6 @@ static void tab_show(int i) {
     save_tabs();
 }
 
-static void tab_switch(int dir) {
-    if (nTabs < 2) { toast("Only one tab open"); return; }
-    CT.scroll = scrollY;
-    tab_show((curTab + dir + nTabs) % nTabs);
-}
-
 static void tab_close_current(void) {
     if (nTabs < 2) { toast("Can't close the last tab"); return; }
     for (int i = curTab; i + 1 < nTabs; i++) tabs[i] = tabs[i + 1];
@@ -1713,7 +1698,7 @@ static void open_link(int i, bool newTab) {
     }
     case LK_TSO: {
         char id[110];
-        snprintf(id, sizeof id, "J:TSO/%s", target);
+        snprintf(id, sizeof id, "J:TSO/%.100s", target);
         int s = src_find(id);
         if (s < 0) { toast("Comic \"%.60s\" isn't in your Asset Pack list", target); return; }
         navigate(s, "0", newTab);
@@ -1725,7 +1710,7 @@ static void open_link(int i, bool newTab) {
             const char *a = strstr(target, "/archive/");
             char alt[260];
             if (a && !strncmp(target, "/sweetbroandhellajeff", 21)) {
-                snprintf(alt, sizeof alt, "/sweetbroandhellajeff/%s", base_of(target));
+                snprintf(alt, sizeof alt, "/sweetbroandhellajeff/%.200s", base_of(target));
                 if (resolve_path(alt, res, sizeof res)) snprintf(target, sizeof target, "%s", alt);
                 else { toast("File not found: %.100s", lk->target); return; }
             } else { toast("File not found: %.100s", lk->target); return; }
@@ -1923,11 +1908,6 @@ static void draw_tabbar(void) {
         fit_text(fFoot, full, w - 12, fit, sizeof fit);
         draw_str(fFoot, fit, i * w + 6, 5, sel ? C_BLACK : (SDL_Color){215, 215, 215, 255});
     }
-}
-
-static int cat_of_src(int s) {
-    for (int c = 0; c < nCats; c++) if (s >= cats[c].first && s < cats[c].first + cats[c].n) return c;
-    return -1;
 }
 
 /* ------------------------------------------------------------- fonts */
@@ -2522,7 +2502,7 @@ static void find_assets(const char *arg) {
     snprintf(assets, sizeof assets, "%s", cand[0]);
     for (int i = 0; i < n; i++) if (has_pack(cand[i])) { snprintf(assets, sizeof assets, "%s", cand[i]); break; }
     char rp[4096];
-    if (realpath(assets, rp)) snprintf(assets, sizeof assets, "%s", rp);   /* always absolute: Ruffle needs it */
+    if (realpath(assets, rp)) snprintf(assets, sizeof assets, "%.500s", rp);   /* always absolute: Ruffle needs it */
     size_t al = strlen(assets);
     while (al > 1 && assets[al - 1] == '/') assets[--al] = 0;
 }

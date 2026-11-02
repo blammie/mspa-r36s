@@ -2,7 +2,7 @@
 # Needs: libsdl2-dev libsdl2-ttf-dev libstb-dev zlib1g-dev
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall $(shell sdl2-config --cflags)
-LDFLAGS ?= $(shell sdl2-config --libs) -lSDL2_ttf -lz
+LDFLAGS ?= $(shell sdl2-config --libs) -lSDL2_ttf -lz -lm
 OUT     ?= mspa_reader.aarch64
 
 $(OUT): mspa_reader.c mjson.c mjson.h gifdec.c gifdec.h
