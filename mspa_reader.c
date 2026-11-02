@@ -7,10 +7,11 @@
  *   <assets>/sweetbroandhellajeff/...   SBaHJ (browsed as an image folder)
  *   galleries.txt                       optional extra "Name|/folder" image galleries
  *
- * Tabs (L2/R2), links on pages (Select), inline images, GIF/PNG/JPEG, Flash via Ruffle
- * (run_flash.sh) and video via run_video.sh.
+ * Tabs, page links, settings, read history, collapsible logs, inline images, GIF/PNG/JPEG.
+ * Flash (.swf) runs through run_flash.sh (Ruffle): as a floating window placed over the page's
+ * art on a sway session (ROCKNIX), fullscreen elsewhere. Videos go through run_video.sh.
  *
- * Usage: mspa_reader [assets_dir]     (or env MSPA_ASSETS)       Env: MSPA_SWAP_AB=1
+ * Usage: mspa_reader [assets_dir]   (else assetpack.txt, ./assets, or a few common folders)
  */
 #include <SDL.h>
 #include <SDL_ttf.h>
@@ -26,7 +27,10 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <glob.h>
 #include <signal.h>
+#include <zlib.h>
+
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
@@ -53,6 +57,13 @@
 #define HIST_MAX 128
 #define MAX_BM 600
 #define MAX_TEX 4096
+#define LOG_BTN_H 24      /* "Show/Hide Pesterlog" button */
+#define LOG_BOX_X 8       /* dashed log box inset from the column edge */
+#define LOG_TEXT_X 22     /* log text inset */
+#define DIR_UP 1
+#define DIR_DOWN 2
+#define DIR_LEFT 4
+#define DIR_RIGHT 8
 
 static const SDL_Color C_BG = {83, 83, 83, 255};
 static const SDL_Color C_PANEL = {198, 198, 198, 255};
@@ -180,15 +191,23 @@ static bool menuMode = true;
 static int overlay;         /* 0 none, 1 link list */
 static int selLink;
 static int libLevel, selCat, selEnt;
-static int dpadDir, stickDir;
+static uint8_t heldPad, heldL, heldR, heldPrev;   /* held directions: D-pad / left stick / right stick */
+static uint32_t repeatAt;
+static int axv[4];                                  /* LX LY RX RY */
+static pid_t flashPid;                              /* windowed flash wrapper (process group leader), 0 = none */
+static bool flashFocused;                           /* gamepad focus is on the flash window */
+static bool swayOk;                                 /* sway session: flashes can run in a window */
+static bool wantFullscreenFix;
+static int flashPhys[4];                            /* flash window x y w h, physical pixels */
+static int logBtnY, logBtnW, logBoxTop, logBoxBottom;
+static char logLabel[40];
 static char toastMsg[200];
 static uint32_t toastUntil;
-typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB; int flashEngine; } Settings;
-static Settings cfg = {55, 1, false, true, false, 0};   /* flashEngine: 0 classic Ruffle, 1 Ruffle Handheld */   /* imgPct: 30..150, 999 = fit column width */
+typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB; bool flashWindow; } Settings;
+static Settings cfg = {55, 1, false, true, false, true};   /* imgPct: 30..150, 999 = fit column width */
 static uint8_t *visitedBits[2];
 static bool logOpen, logPresent, autoRequest, g_noAuto, g_logs;
 static bool selectHeld;
-static pid_t flashPid = 0;
 static int gotoDigits[6], gotoPos, gotoWidth;
 static int setSel;
 enum { MI_HEAD, MI_SRC, MI_CAT, MI_ACT };
@@ -661,8 +680,8 @@ static void page_free(Page *p) { free(p->html); p->html = NULL; p->valid = false
 static void settings_save(void) {
     FILE *f = fopen("conf/settings.txt", "w");
     if (!f) return;
-    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nflashengine=%d\n",
-            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.flashEngine);
+    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nflashwindow=%d\n",
+            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.flashWindow);
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -678,7 +697,7 @@ static void settings_load(void) {
         else if (sscanf(line, "autoflash=%d", &v) == 1) cfg.autoFlash = v != 0;
         else if (sscanf(line, "collapselogs=%d", &v) == 1) cfg.collapseLogs = v != 0;
         else if (sscanf(line, "swapab=%d", &v) == 1) cfg.swapAB = v != 0;
-        else if (sscanf(line, "flashengine=%d", &v) == 1) cfg.flashEngine = v ? 1 : 0;
+        else if (sscanf(line, "flashwindow=%d", &v) == 1) cfg.flashWindow = v != 0;
     }
     free(s);
 }
@@ -1025,13 +1044,13 @@ static void layout_html(TTF_Font *f, const char *html, SDL_Color base, int boxX,
             glue = !sawSpace;
             continue;
         }
-        if (ch == '|') { /* |PESTERLOG| style marker */
+        if (ch == '|') { /* |PESTERLOG| style marker: a collapsible log */
             const char *q = p + 1;
             while ((*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || *q == '_') q++;
             if (*q == '|' && q - p >= 5) {
                 FLUSH_WORD();
                 if (ln) line_emit(f, boxX, boxW, center, y);
-                if (g_logs) {
+                if (g_logs && !logPresent) {
                     char nm[24];
                     size_t nl2 = (size_t)(q - p - 1);
                     if (nl2 >= sizeof nm) nl2 = sizeof nm - 1;
@@ -1040,15 +1059,19 @@ static void layout_html(TTF_Font *f, const char *html, SDL_Color base, int boxX,
                     const char *lab = !strcmp(nm, "PESTERLOG") ? "Pesterlog" : !strcmp(nm, "DIALOGLOG") ? "Dialoglog"
                                     : !strcmp(nm, "SPRITELOG") ? "Spritelog" : !strcmp(nm, "JOURNALOG") ? "Journal log"
                                     : !strcmp(nm, "AUTHORLOG") ? "Author log" : !strcmp(nm, "TRKSTRLOG") ? "Trickster log" : "Log";
-                    char row[96];
-                    snprintf(row, sizeof row, "%s %s (Y)", logOpen ? "[-] Hide" : "[+] Show", lab);
-                    int rw = 0;
-                    TTF_SizeUTF8(fLink, row, &rw, NULL);
+                    snprintf(logLabel, sizeof logLabel, "%s %s", logOpen ? "Hide" : "Show", lab);
+                    int tw = 0;
+                    TTF_SizeUTF8(fFoot, logLabel, &tw, NULL);
                     logPresent = true;
-                    *y += 6;
-                    item_add(fLink, row, C_LINK, boxX + (boxW - rw) / 2, *y);
-                    *y += TTF_FontLineSkip(fLink) + 10;
-                    if (!logOpen) break;
+                    logBtnW = tw + 28;
+                    *y += 10;
+                    logBtnY = *y;
+                    *y += LOG_BTN_H;
+                    if (!logOpen) { *y += 6; break; }
+                    logBoxTop = logBtnY + LOG_BTN_H / 2;   /* the button straddles the dashed border */
+                    *y += 14;
+                    boxX = LOG_TEXT_X;
+                    boxW = COL_W - 2 * LOG_TEXT_X;
                 }
                 center = false;
                 p = q + 1;
@@ -1084,6 +1107,7 @@ static void layout_html(TTF_Font *f, const char *html, SDL_Color base, int boxX,
     }
     FLUSH_WORD();
     line_emit(f, boxX, boxW, center, y);
+    if (g_logs && logPresent && logOpen) { logBoxBottom = *y + 10; *y += 18; }
     curLinkIdx = -1;
 #undef FLUSH_WORD
 }
@@ -1167,6 +1191,69 @@ static void read_hint(const char *swfPath, char *out, size_t n) {
     free(s);
 }
 
+static void fit_text(TTF_Font *f, const char *in, int maxw, char *out, size_t n);
+
+/* ---- shared scale for page art and flash cards */
+static float img_scale(int w) {
+    bool fit = cfg.imgPct >= 999;
+    float s = fit ? 1.0f : (float)cfg.imgPct / 100.0f;
+    if ((float)w * s > (float)COL_W || (fit && w > COL_W)) s = (float)COL_W / (float)w;
+    return s;
+}
+
+/* stage size of a .swf from its header (uncompressed FWS or zlib CWS); false = unknown */
+static bool swf_size(const char *path, int *w, int *h) {
+    uint8_t b[4096], r[32];
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    size_t n = fread(b, 1, sizeof b, f);
+    fclose(f);
+    if (n < 24 || b[1] != 'W' || b[2] != 'S') return false;
+    const uint8_t *rect;
+    size_t have;
+    if (b[0] == 'F') { rect = b + 8; have = n - 8; }
+    else if (b[0] == 'C') {
+        z_stream z;
+        memset(&z, 0, sizeof z);
+        if (inflateInit(&z) != Z_OK) return false;
+        z.next_in = b + 8;
+        z.avail_in = (uInt)(n - 8);
+        z.next_out = r;
+        z.avail_out = sizeof r;
+        int rc = inflate(&z, Z_SYNC_FLUSH);
+        inflateEnd(&z);
+        if (rc != Z_OK && rc != Z_STREAM_END) return false;
+        rect = r;
+        have = sizeof r - z.avail_out;
+    } else return false;
+    if (have < 1) return false;
+    int nb = rect[0] >> 3;
+    if (nb < 1 || nb > 28 || have < (size_t)(5 + 4 * nb + 7) / 8) return false;
+    int bit = 5;
+    int64_t v[4];
+    for (int k = 0; k < 4; k++) {
+        int64_t x = 0;
+        for (int i = 0; i < nb; i++, bit++) x = (x << 1) | ((rect[bit >> 3] >> (7 - (bit & 7))) & 1);
+        if ((x >> (nb - 1)) & 1) x -= (int64_t)1 << nb;
+        v[k] = x;
+    }
+    int ww = (int)((v[1] - v[0]) / 20), hh = (int)((v[3] - v[2]) / 20);
+    if (ww < 16 || hh < 16 || ww > 4000 || hh > 4000) return false;
+    *w = ww;
+    *h = hh;
+    return true;
+}
+
+/* one centred line inside a flash/video card */
+static void card_line(TTF_Font *f, const char *s, const Media *m, int *y) {
+    char fit[200];
+    fit_text(f, s, m->dw - 12, fit, sizeof fit);
+    int w = 0;
+    TTF_SizeUTF8(f, fit, &w, NULL);
+    item_add(f, fit, C_CARDTXT, (COL_W - m->dw) / 2 + (m->dw - w) / 2, *y);
+    *y += TTF_FontLineSkip(f) + 2;
+}
+
 /* inline <img>: only shown if the file exists in the Asset Pack and is a GIF/PNG/JPEG */
 static void place_inline(const char *url, int boxW, int *y) {
     if (nMedia >= MAX_MEDIA) return;
@@ -1202,8 +1289,9 @@ static void build_page(void) {
     int y = COL_TOP + 12;
     int bx = PAD, bw = COL_W - 2 * PAD;
     int mainMedia = nMedia;
+    bool windowed = cfg.flashWindow && swayOk;
 
-    g_links = g_inl = false;
+    g_links = g_inl = g_logs = false;
     layout_html(fTitle, page.title[0] ? page.title : "...", C_BLACK, bx, bw, true, &y);
     y += 10;
 
@@ -1211,28 +1299,32 @@ static void build_page(void) {
         Media *m = &media[i];
         m->y = y;
         if (m->kind == 0) {
-            float s = cfg.imgPct >= 999 ? 1.0f : (float)cfg.imgPct / 100.0f;
-            if ((float)m->w * s > (float)COL_W || (cfg.imgPct >= 999 && m->w > COL_W)) s = (float)COL_W / (float)m->w;
-            m->dw = (int)((float)m->w * s + 0.5f);
-            m->dh = (int)((float)m->h * s + 0.5f);
+            float sc = img_scale(m->w);
+            m->dw = (int)((float)m->w * sc + 0.5f);
+            m->dh = (int)((float)m->h * sc + 0.5f);
             y += m->dh + 2;
-        } else {
+        } else if (m->kind == 1) {            /* flash card, sized like the art would be */
+            int sw = 650, sh = 450;
+            swf_size(m->path, &sw, &sh);
+            float sc = img_scale(sw);
+            m->w = sw;
+            m->h = sh;
+            m->dw = (int)((float)sw * sc + 0.5f);
+            m->dh = (int)((float)sh * sc + 0.5f);
+            int avail = SCR_H - TB - y - 26;  /* the whole card must be on screen at scroll 0 */
+            if (avail > 60 && m->dh > avail) { m->dw = m->dw * avail / m->dh; m->dh = avail; }
+            int cy = y + m->dh / 2 - 24;
+            card_line(fBody, "[ Flash ]", m, &cy);
+            card_line(fFoot, windowed ? "Y: play (opens over the page)" : "Y: play (fullscreen)", m, &cy);
+            char hint[200];
+            read_hint(m->path, hint, sizeof hint);
+            if (hint[0]) card_line(fFoot, hint, m, &cy);
+            y += m->dh + 2;
+        } else {                              /* video / message card */
             int cy = y + 12;
             char txt[900];
-            if (m->kind == 1) {
-                char hint[200];
-                read_hint(m->path, hint, sizeof hint);
-                snprintf(txt, sizeof txt, "[ Flash animation ]<br />Press Y to play (Ruffle)<br />Select+Start exits the flash%s%s", hint[0] ? "<br />" : "", hint);
-            } else if (m->kind == 3) {
-                char conv[700];
-                snprintf(conv, sizeof conv, "%s", m->path);
-                char *d = strrchr(conv, '.');
-                if (d) *d = 0;
-                strncat(conv, ".r36s.mp4", sizeof conv - strlen(conv) - 1);
-                snprintf(txt, sizeof txt, "[ Video ]<br />Press Y to play<br />%s", file_exists(conv) ? "(converted copy found)" : "(run convert_videos.ps1 on a PC for a handheld-friendly copy)");
-            } else {
-                snprintf(txt, sizeof txt, "%s", m->label);
-            }
+            if (m->kind == 3) snprintf(txt, sizeof txt, "[ Video ]<br />Press Y to play");
+            else snprintf(txt, sizeof txt, "%s", m->label);
             layout_html(fBody, txt, C_CARDTXT, bx + 10, bw - 20, true, &cy);
             m->dw = COL_W;
             m->dh = cy + 12 - y;
@@ -1277,13 +1369,15 @@ static void build_page(void) {
     /* footer */
     y += 18;
     int fs = TTF_FontLineSkip(fFoot);
-    const char *fl[6];
+    const char *fl[8];
     int nf = 0;
+    bool act = has_kind(1) || has_kind(3);
     fl[nf++] = "Go Back (B)";
     fl[nf++] = "Menu (X)";
     if (has_kind(1)) fl[nf++] = "Play Flash (Y)";
     if (has_kind(3)) fl[nf++] = "Play Video (Y)";
-    if (nLinks > 0) fl[nf++] = "Links (Select)";
+    if (logPresent) fl[nf++] = act ? (logOpen ? "Hide Log (Select+X)" : "Show Log (Select+X)") : (logOpen ? "Hide Log (Y)" : "Show Log (Y)");
+    if (nLinks > 0) fl[nf++] = "Links (Start)";
     fl[nf++] = "Tabs (L2/R2)";
     int fx = bx;
     for (int i = 0; i < nf; i++) {
@@ -1348,9 +1442,117 @@ static void video_shutdown(void) {
 /* ------------------------------------------------------------- page flow */
 static int max_scroll(void) { return pageH > VIEW_H ? pageH - VIEW_H : 0; }
 
+/* ------------------------------------------------------------- sway (ROCKNIX) + flash window */
+/* Windowed flashes need a sway session: the reader keeps running, Ruffle is a floating window
+   placed over the flash card, and swaymsg moves focus between the two. */
+static void sway_detect(void) {
+    swayOk = false;
+    const char *drv = SDL_GetCurrentVideoDriver();
+    if (!drv || strcmp(drv, "wayland") != 0) return;
+    const char *s = getenv("SWAYSOCK");
+    if (!s || !*s) {
+        glob_t g;
+        if (glob("/run/user/*/sway-ipc.*.sock", 0, NULL, &g) == 0 && g.gl_pathc > 0) setenv("SWAYSOCK", g.gl_pathv[0], 1);
+        globfree(&g);
+        s = getenv("SWAYSOCK");
+    }
+    if (!s || !*s || access(s, F_OK) != 0) return;
+    swayOk = system("command -v swaymsg >/dev/null 2>&1") == 0;
+}
+
+static void sway_cmd(const char *fmt, ...) {
+    char inner[200], cmd[260];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(inner, sizeof inner, fmt, ap);
+    va_end(ap);
+    snprintf(cmd, sizeof cmd, "swaymsg '%s' >/dev/null 2>&1", inner);
+    if (system(cmd) != 0) { /* sway not reachable: nothing else to do */ }
+}
+
+static void flash_reader_back(void) {   /* give the screen and focus back to the reader */
+    flashFocused = false;
+    if (swayOk) sway_cmd("[pid=%d] fullscreen enable, focus", (int)getpid());
+}
+
+/* the flash card's rectangle in physical pixels (page at scroll 0), accounting for letterboxing */
+static void flash_rect(const Media *m) {
+    int ow = SCR_W, oh = SCR_H;
+    SDL_GetRendererOutputSize(ren, &ow, &oh);
+    float sx = (float)ow / SCR_W, sy = (float)oh / SCR_H, sc = sx < sy ? sx : sy;
+    float ox = ((float)ow - SCR_W * sc) / 2.0f, oy = ((float)oh - SCR_H * sc) / 2.0f;
+    flashPhys[0] = (int)(ox + (float)(COL_X + (COL_W - m->dw) / 2) * sc + 0.5f);
+    flashPhys[1] = (int)(oy + (float)(TB + m->y) * sc + 0.5f);
+    flashPhys[2] = (int)((float)m->dw * sc + 0.5f);
+    flashPhys[3] = (int)((float)m->dh * sc + 0.5f);
+}
+
+static void flash_stop(void) {
+    if (!flashPid) return;
+    kill(-flashPid, SIGTERM);
+    for (int i = 0; i < 40 && flashPid; i++) {
+        int st;
+        if (waitpid(flashPid, &st, WNOHANG) == flashPid) flashPid = 0;
+        else SDL_Delay(50);
+    }
+    if (flashPid) { kill(-flashPid, SIGKILL); waitpid(flashPid, NULL, 0); flashPid = 0; }
+    heldPad = heldL = heldR = heldPrev = 0;
+    flash_reader_back();
+}
+
+static bool flash_poll(void) {            /* the flash ended by itself (Select+Start inside it, or it crashed) */
+    if (!flashPid) return false;
+    int st;
+    if (waitpid(flashPid, &st, WNOHANG) != flashPid) return false;
+    flashPid = 0;
+    heldPad = heldL = heldR = heldPrev = 0;
+    flash_reader_back();
+    return true;
+}
+
+static void flash_focus(bool toFlash) {
+    if (!flashPid || !swayOk) return;
+    if (toFlash) {
+        int pid = 0;
+        FILE *f = fopen("/tmp/mspa_flash.pid", "r");
+        if (f) { if (fscanf(f, "%d", &pid) != 1) pid = 0; fclose(f); }
+        if (pid <= 0) { toast("The flash window isn't ready yet"); return; }
+        sway_cmd("[pid=%d] focus", pid);
+        flashFocused = true;
+    } else {
+        sway_cmd("[pid=%d] focus", (int)getpid());
+        flashFocused = false;
+    }
+}
+
+static void flash_start_windowed(const Media *m) {
+    if (flashPid) return;
+    scrollY = 0;                           /* the page stays locked at the top while a flash runs */
+    flash_rect(m);
+    char v[32];
+    setenv("MSPA_SWF", m->path, 1);
+    setenv("MSPA_FLASH_MODE", "window", 1);
+    snprintf(v, sizeof v, "%d", flashPhys[0]); setenv("MSPA_WIN_X", v, 1);
+    snprintf(v, sizeof v, "%d", flashPhys[1]); setenv("MSPA_WIN_Y", v, 1);
+    snprintf(v, sizeof v, "%d", flashPhys[2]); setenv("MSPA_WIN_W", v, 1);
+    snprintf(v, sizeof v, "%d", flashPhys[3]); setenv("MSPA_WIN_H", v, 1);
+    snprintf(v, sizeof v, "%d", (int)getpid()); setenv("MSPA_READER_PID", v, 1);
+    pid_t pid = fork();
+    if (pid < 0) { toast("Could not start the flash"); return; }
+    if (pid == 0) {
+        setsid();
+        execlp("bash", "bash", "./run_flash.sh", (char *)NULL);
+        _exit(127);
+    }
+    flashPid = pid;
+    flashFocused = false;
+    toast("Flash running.  Y: use it   B: close it");
+}
+
 static void open_page(const char *key, bool push) {
     Page np;
     if (!src_load_page(CT.src, key, &np)) { g_noAuto = false; toast("Page not found: %.60s", key); return; }
+    flash_stop();
     media_free();
     if (push && havePage) {
         if (CT.nHist >= HIST_MAX) { memmove(CT.hist[0], CT.hist[1], (size_t)(HIST_MAX - 1) * 24); CT.nHist = HIST_MAX - 1; }
@@ -1419,7 +1621,7 @@ static void jump(int steps) {
 
 /* ------------------------------------------------------------- tabs */
 static void tab_new(int src, const char *keyIn) {
-    if (nTabs >= MAX_TABS) { toast("Tab limit (%d). Close one: menu (X), then Select", MAX_TABS); return; }
+    if (nTabs >= MAX_TABS) { toast("Tab limit (%d). Close one: menu (X), then Start", MAX_TABS); return; }
     char key[24];
     snprintf(key, sizeof key, "%s", keyIn);
     if (!src_has_page(src, key)) src_start_key(src, key, sizeof key);
@@ -1536,43 +1738,38 @@ static void open_link(int i, bool newTab) {
     }
 }
 
-static void play_external(int kind) {
-    const char *path = NULL;
-    for (int i = 0; i < nMedia; i++) if (media[i].kind == kind) { path = media[i].path; break; }
-    if (!path) return;
-
-    /* Kill the entire process group of any existing media */
-if (flashPid > 0) {
-    int status;
-    pid_t res = waitpid(flashPid, &status, WNOHANG);
-    if (res != 0) {
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 2) toast("No video player found");
-        flashPid = 0;
-        SDL_RestoreWindow(win); /* Bring reader back when media finishes */
-    }
-}
+static void run_blocking(int kind, const char *path) {   /* fullscreen flash or video: the reader steps aside */
+    char p[640], key[24], v[16];
+    snprintf(p, sizeof p, "%s", path);
+    snprintf(key, sizeof key, "%s", page.id);
+    int sc = scrollY, ow = SCR_W, oh = SCR_H;
+    SDL_GetRendererOutputSize(ren, &ow, &oh);
     CT.scroll = scrollY;
     save_tabs();
-
-    /* Hide the reader so the flash/video appears on top */
-    SDL_MinimizeWindow(win);
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        /* --- CHILD PROCESS --- */
-        setpgid(0, 0); /* Put child in its own process group so we can kill the whole tree */
-        setenv(kind == 1 ? "MSPA_SWF" : "MSPA_VIDEO", path, 1);
-        setenv("MSPA_FLASH_ENGINE", cfg.flashEngine ? "handheld" : "classic", 1);
-        execl("/bin/bash", "bash", kind == 1 ? "./run_flash.sh" : "./run_video.sh", (char *)NULL);
-        _exit(1);
-    } else if (pid > 0) {
-        /* --- PARENT PROCESS --- */
-        flashPid = pid;
-    } else {
-        toast("Failed to start media");
-        SDL_RestoreWindow(win);
-    }
+    video_shutdown();
+    snprintf(v, sizeof v, "%d", ow); setenv("MSPA_SCREEN_W", v, 1);
+    snprintf(v, sizeof v, "%d", oh); setenv("MSPA_SCREEN_H", v, 1);
+    setenv(kind == 1 ? "MSPA_SWF" : "MSPA_VIDEO", p, 1);
+    setenv("MSPA_FLASH_MODE", "full", 1);
+    int rc = system(kind == 1 ? "bash ./run_flash.sh" : "bash ./run_video.sh");
+    heldPad = heldL = heldR = heldPrev = 0;
+    selectHeld = false;
+    video_init();
+    wantFullscreenFix = swayOk;
+    g_noAuto = true;
+    open_page(key, false);
+    scrollY = sc > max_scroll() ? max_scroll() : sc;
+    if (kind == 3 && WIFEXITED(rc) && WEXITSTATUS(rc) == 2) toast("No video player found on this system");
 }
+
+static void play_external(int kind) {
+    int mi = -1;
+    for (int i = 0; i < nMedia; i++) if (media[i].kind == kind) { mi = i; break; }
+    if (mi < 0) return;
+    if (kind == 1 && cfg.flashWindow && swayOk) flash_start_windowed(&media[mi]);
+    else run_blocking(kind, media[mi].path);
+}
+
 static void restore_tabs(void) {
     char *s = (char *)read_file("conf/tabs.txt", NULL);
     if (!s) return;
@@ -1637,6 +1834,7 @@ static void goto_number(int n) {
 }
 
 static void goto_dialog_open(void) {
+    flash_stop();
     if (nTabs == 0) { lib_open(4, true); if (nTabs == 0) return; }
     menuMode = false;
     int v = 0;
@@ -1915,16 +2113,16 @@ static void draw_settings(void) {
     snprintf(v[0], 48, "< %s >", img_label(ib, sizeof ib));
     snprintf(v[1], 48, "< %s >", tsz[cfg.textSize]);
     snprintf(v[2], 48, "< %s >", cfg.autoFlash ? "On" : "Off");
-    snprintf(v[3], 48, "< %s >", cfg.flashEngine ? "Ruffle Handheld" : "Classic");
+    snprintf(v[3], 48, "< %s >", !swayOk ? "Fullscreen (needs ROCKNIX)" : cfg.flashWindow ? "Window" : "Fullscreen");
     snprintf(v[4], 48, "< %s >", cfg.collapseLogs ? "Collapsed" : "Shown");
     snprintf(v[5], 48, "< %s >", cfg.swapAB ? "On" : "Off");
     snprintf(v[6], 48, "A: clear");
     v[7][0] = 0;
-    static const char *nm[] = {"Image size", "Text size", "Auto-play Flash pages", "Flash engine", "Pesterlogs & other logs", "Swap A/B buttons", "Clear read history", "Back"};
+    static const char *nm[] = {"Image size", "Text size", "Auto-play Flash pages", "Flash display", "Pesterlogs & other logs", "Swap A/B buttons", "Clear read history", "Back"};
     static const char *ds[] = {"How big page art is drawn. Smaller = more text visible without scrolling.",
                                "Page text size.", "Start a page's Flash automatically when you arrive on it.",
-                               "Classic = the Ruffle build used so far. Ruffle Handheld = per-flash profiles (experimental).",
-                               "Start logs hidden behind a Show button (Y), like the website.",
+                               "Window = plays over the page's art (ROCKNIX). Fullscreen = takes the whole screen.",
+                               "Start logs hidden behind a Show button, like the website.",
                                "For controllers whose A/B are labelled the other way round.",
                                "Forget which pages you've read (purple links).", ""};
     for (int i = 0; i < 8; i++) {
@@ -1932,7 +2130,7 @@ static void draw_settings(void) {
         bool sel = i == setSel;
         if (sel) fill(C_HILITE, COL_X + 6, y - 4, COL_W - 12, 38);
         draw_str(sel ? fLink : fMenu, nm[i], COL_X + PAD, y, sel ? C_LINK : C_BLACK);
-        draw_right(fMenu, v[i], COL_X + COL_W - PAD, y, C_BLACK);
+        draw_right(i == 3 && !swayOk ? fFoot : fMenu, v[i], COL_X + COL_W - PAD, i == 3 && !swayOk ? y + 6 : y, C_BLACK);
     }
     if (ds[setSel][0]) {
         char fit[260];
@@ -1950,26 +2148,28 @@ static void draw_controls(void) {
     draw_center(fTitle, "Controls", top + 4, C_BLACK);
     static const char *L[][2] = {
         {"READING", ""},
-        {"A", "Next page / follow chosen link"},
-        {"B", "Back"},
+        {"A", "Next page / follow the chosen link"},
+        {"B", "Back (closes a running flash first)"},
         {"X", "Main menu"},
-        {"Y", "Play Flash/video; else show/hide log"},
+        {"Y", "Play flash/video; show/hide the log"},
+        {"Select+X", "Show/hide the log (on flash pages)"},
+        {"Start / L3", "Links on this page"},
+        {"R3", "Go to a page number"},
         {"L1 / R1", "Jump 10 pages back / forward"},
         {"L2 / R2", "Previous / next tab"},
-        {"Up / Down", "Scroll (right stick too)"},
-        {"Left / Right", "Pick a choice on branching pages"},
-        {"L3 or Start", "Links on this page"},
-        {"R3", "Go to a page number"},
-        {"MENU", ""},
-        {"A / Y", "Open here / open in a new tab"},
-        {"R3 or Start", "Close the current tab"},
-        {"FLASH (Ruffle)", ""},
-        {"Select+Start", "Quit the flash (and the game)"},
-        {"Select+X", "Mouse mode: D-pad moves, Y clicks"},
+        {"D-pad, sticks", "Up/Down scroll; Left/Right pick a link"},
+        {"MENUS", ""},
+        {"A / Y", "Open here / in a new tab"},
+        {"Start / R3", "Close the current tab"},
+        {"D-pad, sticks", "Move; Left/Right change a setting"},
+        {"FLASH WINDOW", ""},
+        {"Y", "Give the flash control"},
+        {"Select+Y", "Give control back to the page"},
+        {"Select+Start", "Quit the flash, or quit from the page"},
     };
-    int y = top + 40;
+    int y = top + 36;
     for (int i = 0; i < (int)(sizeof L / sizeof L[0]); i++) {
-        if (!L[i][1][0]) { y += 4; draw_str(fCtl, L[i][0], COL_X + PAD, y, C_GREY); y += TTF_FontLineSkip(fCtl) + 1; continue; }
+        if (!L[i][1][0]) { y += 3; draw_str(fCtl, L[i][0], COL_X + PAD, y, C_GREY); y += TTF_FontLineSkip(fCtl); continue; }
         draw_str(fCtl, L[i][0], COL_X + PAD, y, C_BLACK);
         draw_str(fCtl, L[i][1], COL_X + PAD + 150, y, C_BLACK);
         y += TTF_FontLineSkip(fCtl);
@@ -1985,10 +2185,34 @@ static void draw_library(void) {
 }
 
 /* ------------------------------------------------------------- page view */
-static int max_scroll_(void) { return pageH > VIEW_H ? pageH - VIEW_H : 0; }
+
+static void draw_dashed(int x, int y, int w, int h) {
+    SDL_Color c = {150, 150, 150, 255};
+    for (int i = 0; i < w; i += 8) {
+        int l = w - i < 5 ? w - i : 5;
+        if (y >= TB && y < SCR_H) fill(c, x + i, y, l, 1);
+        if (y + h - 1 >= TB && y + h - 1 < SCR_H) fill(c, x + i, y + h - 1, l, 1);
+    }
+    for (int j = 0; j < h; j += 8) {
+        int l = h - j < 5 ? h - j : 5;
+        if (y + j + l < TB || y + j > SCR_H) continue;
+        fill(c, x, y + j, 1, l);
+        fill(c, x + w - 1, y + j, 1, l);
+    }
+}
+
+static void draw_log_button(int oy) {
+    int bx = COL_X + (COL_W - logBtnW) / 2, by = logBtnY + oy;
+    if (by + LOG_BTN_H < TB || by > SCR_H) return;
+    fill((SDL_Color){118, 118, 118, 255}, bx, by, logBtnW, LOG_BTN_H);
+    fill((SDL_Color){239, 239, 239, 255}, bx + 1, by + 1, logBtnW - 2, LOG_BTN_H - 2);
+    int tw = 0;
+    TTF_SizeUTF8(fFoot, logLabel, &tw, NULL);
+    draw_str(fFoot, logLabel, bx + (logBtnW - tw) / 2, by + (LOG_BTN_H - TTF_FontLineSkip(fFoot)) / 2, C_BLACK);
+}
 
 static void draw_page(void) {
-    int ms = max_scroll_();
+    int ms = max_scroll();
     if (scrollY > ms) scrollY = ms;
     if (scrollY < 0) scrollY = 0;
     int oy = TB - scrollY;
@@ -2000,16 +2224,21 @@ static void draw_page(void) {
         Media *m = &media[i];
         int sy = m->y + oy;
         if (sy + m->dh < TB || sy > SCR_H) continue;
+        int mx = COL_X + (COL_W - m->dw) / 2;
         if (m->kind == 0 && m->tex) {
-            SDL_Rect dst = {COL_X + (COL_W - m->dw) / 2, sy, m->dw, m->dh};
+            SDL_Rect dst = {mx, sy, m->dw, m->dh};
             SDL_RenderCopy(ren, m->tex, NULL, &dst);
         } else if (m->kind != 0) {
-            fill(C_CARD, COL_X, sy, COL_W, m->dh);
+            fill(C_CARD, mx, sy, m->dw, m->dh);
         }
     }
     if (page.nnext > 1) {
         int t = choiceTop[selChoice] + oy, h = choiceBot[selChoice] - choiceTop[selChoice];
         fill(C_HILITE, COL_X + 6, t - 3, COL_W - 12, h + 6);
+    }
+    if (logPresent) {
+        if (logOpen) draw_dashed(COL_X + LOG_BOX_X, logBoxTop + oy, COL_W - 2 * LOG_BOX_X, logBoxBottom - logBoxTop);
+        draw_log_button(oy);
     }
     int lo = scrollY - 6, hi = scrollY + VIEW_H + 6;
     for (int i = 0; i < nItems; i++) {
@@ -2019,15 +2248,22 @@ static void draw_page(void) {
             continue;
         }
         if (!it->tex) {
-            SDL_Surface *s = TTF_RenderUTF8_Blended(it->font, it->text, it->col);
-            if (!s) continue;
-            it->tex = SDL_CreateTextureFromSurface(ren, s);
-            SDL_FreeSurface(s);
+            SDL_Surface *sf = TTF_RenderUTF8_Blended(it->font, it->text, it->col);
+            if (!sf) continue;
+            it->tex = SDL_CreateTextureFromSurface(ren, sf);
+            SDL_FreeSurface(sf);
             if (!it->tex) continue;
         }
         SDL_Rect r = {COL_X + it->x, it->y + oy, it->w, it->h};
         SDL_RenderCopy(ren, it->tex, NULL, &r);
     }
+}
+
+static void draw_flash_strip(void) {
+    const char *t = flashFocused ? "FLASH HAS CONTROL  -  Select+Y: back to the page  |  Select+Start: quit the flash"
+                                 : "FLASH RUNNING  -  Y: control it  |  B: close it  |  the page is locked while it plays";
+    fill_a((SDL_Color){0, 0, 0, 255}, 215, 0, SCR_H - 20, SCR_W, 20);
+    draw_center(fFoot, t, SCR_H - 17, C_CARDTXT);
 }
 
 static const char *link_tag(const Link *l) {
@@ -2116,6 +2352,7 @@ static void animate(bool *dirty) {
 
 /* ------------------------------------------------------------- input */
 static void open_library(void) {
+    flash_stop();
     save_tabs();
     menuMode = true;
     overlay = 0;
@@ -2140,7 +2377,10 @@ static void settings_adjust(int dir) {
         break;
     case 1: cfg.textSize += dir; if (cfg.textSize < 0) cfg.textSize = 0; if (cfg.textSize > 2) cfg.textSize = 2; break;
     case 2: cfg.autoFlash = !cfg.autoFlash; break;
-    case 3: cfg.flashEngine = !cfg.flashEngine; break;
+    case 3:
+        cfg.flashWindow = !cfg.flashWindow;
+        if (cfg.flashWindow && !swayOk) toast("Flash windows need a ROCKNIX (sway) session: using fullscreen");
+        break;
     case 4: cfg.collapseLogs = !cfg.collapseLogs; break;
     case 5: cfg.swapAB = !cfg.swapAB; break;
     case 6: if (dir == 0) { visited_clear(); toast("Read history cleared"); } return;
@@ -2156,6 +2396,8 @@ static void handle_menu(int b) {
     if (loadError[0]) return;
     if (b == SDL_CONTROLLER_BUTTON_DPAD_UP) menu_move(-1);
     if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) menu_move(1);
+    if (b == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) for (int i = 0; i < 6; i++) menu_move(-1);
+    if (b == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) for (int i = 0; i < 6; i++) menu_move(1);
     if (b == SDL_CONTROLLER_BUTTON_RIGHTSTICK || b == SDL_CONTROLLER_BUTTON_START) { if (nTabs > 0) tab_close_current(); return; }
     if ((b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_X) && nTabs > 0) { menuMode = false; return; }
     if (b != SDL_CONTROLLER_BUTTON_A && b != SDL_CONTROLLER_BUTTON_Y) return;
@@ -2219,24 +2461,39 @@ static void handle_links(int b) {
     if (b == SDL_CONTROLLER_BUTTON_Y) { int i = selLink; overlay = 0; open_link(i, false); }
 }
 
+static void toggle_log(void) {
+    if (!logPresent) return;
+    logOpen = !logOpen;
+    rebuild_layout();
+}
+
 static void handle_reading(int b) {
-    if (b == SDL_CONTROLLER_BUTTON_A) go_next();
-    if (b == SDL_CONTROLLER_BUTTON_B) go_prev();
-    if (b == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) jump(-10);
-    if (b == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) jump(10);
-    if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT && page.nnext > 1 && selChoice > 0) selChoice--;
-    if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT && page.nnext > 1 && selChoice + 1 < page.nnext) selChoice++;
-    if (b == SDL_CONTROLLER_BUTTON_Y) {
+    if (flashPid) {                              /* a windowed flash is running; the page is locked */
+        if (b == SDL_CONTROLLER_BUTTON_Y) { flash_focus(true); return; }
+        if (b == SDL_CONTROLLER_BUTTON_B) { flash_stop(); toast("Flash closed"); return; }
+    }
+    switch (b) {
+    case SDL_CONTROLLER_BUTTON_A: go_next(); break;
+    case SDL_CONTROLLER_BUTTON_B: go_prev(); break;
+    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: jump(-10); break;
+    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: jump(10); break;
+    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: if (page.nnext > 1 && selChoice > 0) selChoice--; break;
+    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: if (page.nnext > 1 && selChoice + 1 < page.nnext) selChoice++; break;
+    case SDL_CONTROLLER_BUTTON_Y:
         if (has_kind(1)) play_external(1);
         else if (has_kind(3)) play_external(3);
-        else if (logPresent) { logOpen = !logOpen; rebuild_layout(); }
-    }
-    if (b == SDL_CONTROLLER_BUTTON_X) open_library();
-    if (b == SDL_CONTROLLER_BUTTON_LEFTSTICK || b == SDL_CONTROLLER_BUTTON_START) {
-        if (nLinks > 0) { overlay = 1; selLink = 0; }
+        else toggle_log();
+        break;
+    case SDL_CONTROLLER_BUTTON_X:
+        if (selectHeld) toggle_log(); else open_library();
+        break;
+    case SDL_CONTROLLER_BUTTON_START:
+    case SDL_CONTROLLER_BUTTON_LEFTSTICK:
+        if (nLinks > 0) { flash_stop(); overlay = 1; selLink = 0; }
         else toast("No links on this page");
+        break;
+    case SDL_CONTROLLER_BUTTON_RIGHTSTICK: goto_dialog_open(); break;
     }
-    if (b == SDL_CONTROLLER_BUTTON_RIGHTSTICK) goto_dialog_open();
 }
 
 /* ------------------------------------------------------------- startup */
@@ -2270,12 +2527,38 @@ static void find_assets(const char *arg) {
     while (al > 1 && assets[al - 1] == '/') assets[--al] = 0;
 }
 
+static void dispatch_button(int b) {
+    if (menuMode) {
+        switch (libLevel) {
+        case 0: handle_menu(b); break;
+        case 1: handle_category(b); break;
+        case 2: handle_settings(b); break;
+        default: if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_A) libLevel = 0;
+        }
+    }
+    else if (overlay == 1) handle_links(b);
+    else if (overlay == 2) handle_goto(b);
+    else handle_reading(b);
+}
+
+/* analog stick -> direction bits, with hysteresis so a drifting stick doesn't flutter */
+static uint8_t stick_bits(int x, int y, uint8_t cur) {
+    uint8_t r = 0;
+    if (x < ((cur & DIR_LEFT) ? -9000 : -16000)) r |= DIR_LEFT;
+    if (x > ((cur & DIR_RIGHT) ? 9000 : 16000)) r |= DIR_RIGHT;
+    if (y < ((cur & DIR_UP) ? -9000 : -16000)) r |= DIR_UP;
+    if (y > ((cur & DIR_DOWN) ? 9000 : 16000)) r |= DIR_DOWN;
+    return r;
+}
+
 int main(int argc, char **argv) {
     mkdir("conf", 0755);
+    signal(SIGPIPE, SIG_IGN);
     find_assets(argc > 1 ? argv[1] : NULL);
     settings_load();
     visited_load();
 
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");   /* lets the page take focus back from a flash */
     if (SDL_Init(0) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
     TTF_Init();
     apply_text_size();
@@ -2288,6 +2571,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (!video_init()) { fprintf(stderr, "video init failed: %s\n", SDL_GetError()); return 1; }
+    sway_detect();
+    fprintf(stderr, "video driver: %s, windowed flashes: %s\n", SDL_GetCurrentVideoDriver(), swayOk ? "yes" : "no");
 
     fill(C_BG, 0, 0, SCR_W, SCR_H);
     draw_center(fTitle, "Loading...", SCR_H / 2 - 12, C_CARDTXT);
@@ -2296,92 +2581,117 @@ int main(int argc, char **argv) {
     if (load_data()) { bm_load(); build_menu(); restore_tabs(); }
 
     bool running = true, dirty = true, trigL = false, trigR = false;
+    uint32_t last = SDL_GetTicks();
     while (running) {
+        uint32_t now = SDL_GetTicks(), dt = now - last;
+        last = now;
+        if (dt > 60) dt = 60;
+
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) running = false;
-            if (e.type == SDL_CONTROLLERAXISMOTION) {
-                if (e.caxis.axis == SDL_CONTROLLER_AXIS_RIGHTY)
-                    stickDir = e.caxis.value > 12000 ? 1 : e.caxis.value < -12000 ? -1 : 0;
-                bool l = e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT, r = e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
-                if (l || r) {
-                    bool on = e.caxis.value > 16000;
-                    bool *st = l ? &trigL : &trigR;
-                    if (on && !*st && !overlay && nTabs > 1) { CT.scroll = scrollY; tab_show((curTab + (l ? -1 : 1) + nTabs) % nTabs); dirty = true; }
-                    else if (on && !*st && nTabs == 1) toast("Only one tab open");
+            switch (e.type) {
+            case SDL_QUIT: running = false; break;
+            case SDL_CONTROLLERDEVICEADDED: SDL_GameControllerOpen(e.cdevice.which); break;
+            case SDL_CONTROLLERAXISMOTION: {
+                int v = e.caxis.value;
+                switch (e.caxis.axis) {
+                case SDL_CONTROLLER_AXIS_LEFTX: axv[0] = v; break;
+                case SDL_CONTROLLER_AXIS_LEFTY: axv[1] = v; break;
+                case SDL_CONTROLLER_AXIS_RIGHTX: axv[2] = v; break;
+                case SDL_CONTROLLER_AXIS_RIGHTY: axv[3] = v; break;
+                case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+                case SDL_CONTROLLER_AXIS_TRIGGERRIGHT: {
+                    bool left = e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT, on = v > 16000;
+                    bool *st = left ? &trigL : &trigR;
+                    if (on && !*st && !(flashPid && flashFocused) && !overlay && nTabs > 0) {
+                        if (nTabs > 1) { CT.scroll = scrollY; tab_show((curTab + (left ? -1 : 1) + nTabs) % nTabs); }
+                        else toast("Only one tab open");
+                        dirty = true;
+                    }
                     *st = on;
+                    break;
                 }
+                default: break;
+                }
+                heldL = stick_bits(axv[0], axv[1], heldL);
+                heldR = stick_bits(axv[2], axv[3], heldR);
+                break;
             }
-            if (e.type != SDL_CONTROLLERBUTTONDOWN && e.type != SDL_CONTROLLERBUTTONUP) continue;
-            int b = e.cbutton.button;
-            bool down = e.type == SDL_CONTROLLERBUTTONDOWN;
-            if (cfg.swapAB) {
-                if (b == SDL_CONTROLLER_BUTTON_A) b = SDL_CONTROLLER_BUTTON_B;
-                else if (b == SDL_CONTROLLER_BUTTON_B) b = SDL_CONTROLLER_BUTTON_A;
-            }
-            if (b == SDL_CONTROLLER_BUTTON_BACK) selectHeld = down;
-            if (b == SDL_CONTROLLER_BUTTON_DPAD_UP) dpadDir = down ? -1 : (dpadDir == -1 ? 0 : dpadDir);
-            if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) dpadDir = down ? 1 : (dpadDir == 1 ? 0 : dpadDir);
-            if (!down) continue;
-if (b == SDL_CONTROLLER_BUTTON_START && selectHeld) {
-    if (flashPid > 0) {
-        kill(-flashPid, SIGTERM); /* Kill the whole process group */
-        waitpid(flashPid, NULL, 0);
-        flashPid = 0;
-        SDL_RestoreWindow(win); /* Bring the reader back */
-        toast("Media closed");
-    } else {
-        running = false; 
-    }
-    continue;
-}
-            if (b == SDL_CONTROLLER_BUTTON_BACK) continue;
-            if (menuMode) {
-                if (libLevel == 0) handle_menu(b);
-                else if (libLevel == 1) handle_category(b);
-                else if (libLevel == 2) handle_settings(b);
-                else if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_A) libLevel = 0;
-            }
-            else if (overlay == 1) handle_links(b);
-            else if (overlay == 2) handle_goto(b);
-            else handle_reading(b);
-            dirty = true;
-        }
-        if (!menuMode && !overlay) {
-            int dir = dpadDir ? dpadDir : stickDir;
-            if (dir) {
-                scrollY += dir * 8;
-                int ms = max_scroll_();
-                if (scrollY < 0) scrollY = 0;
-                if (scrollY > ms) scrollY = ms;
+            case SDL_CONTROLLERBUTTONDOWN:
+            case SDL_CONTROLLERBUTTONUP: {
+                int b = e.cbutton.button;
+                bool down = e.type == SDL_CONTROLLERBUTTONDOWN;
+                if (cfg.swapAB) {
+                    if (b == SDL_CONTROLLER_BUTTON_A) b = SDL_CONTROLLER_BUTTON_B;
+                    else if (b == SDL_CONTROLLER_BUTTON_B) b = SDL_CONTROLLER_BUTTON_A;
+                }
+                uint8_t bit = b == SDL_CONTROLLER_BUTTON_DPAD_UP ? DIR_UP : b == SDL_CONTROLLER_BUTTON_DPAD_DOWN ? DIR_DOWN
+                            : b == SDL_CONTROLLER_BUTTON_DPAD_LEFT ? DIR_LEFT : b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT ? DIR_RIGHT : 0;
+                if (bit) { if (down) heldPad |= bit; else heldPad &= (uint8_t)~bit; break; }
+                if (b == SDL_CONTROLLER_BUTTON_BACK) selectHeld = down;
+                if (flashPid && flashFocused) {            /* the flash has the controls; only "back to the page" is ours */
+                    if (down && b == SDL_CONTROLLER_BUTTON_Y && selectHeld) { flash_focus(false); dirty = true; }
+                    break;
+                }
+                if (!down || b == SDL_CONTROLLER_BUTTON_BACK) break;
+                if (b == SDL_CONTROLLER_BUTTON_START && selectHeld) { running = false; break; }   /* Select+Start = quit */
+                dispatch_button(b);
                 dirty = true;
+                break;
             }
-            animate(&dirty);
+            default: break;
+            }
         }
-        if (menuMode && libLevel == 0 && (dpadDir || stickDir) && false) dirty = true;
-        if (toastUntil && SDL_GetTicks() < toastUntil + 50) dirty = true;
-        if (flashPid > 0) {
-    int status; pid_t res = waitpid(flashPid, &status, WNOHANG);
-    if (res != 0) {
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 2) toast("No video player found");
-        flashPid = 0;
-    }
-}
+
+        /* D-pad and both sticks are the same directional input; holding repeats */
+        uint8_t h = (flashPid && flashFocused) ? 0 : (uint8_t)(heldPad | heldL | heldR);
+        bool reading = !menuMode && !overlay;
+        uint8_t pressed = (uint8_t)(h & ~heldPrev);
+        if (pressed) repeatAt = now + 380;
+        else if (h && now >= repeatAt) { pressed = h; repeatAt = now + 110; }
+        heldPrev = h;
+        if (reading) pressed &= (uint8_t)~(DIR_UP | DIR_DOWN);        /* up/down scroll smoothly instead */
+        if (pressed & DIR_UP) { dispatch_button(SDL_CONTROLLER_BUTTON_DPAD_UP); dirty = true; }
+        if (pressed & DIR_DOWN) { dispatch_button(SDL_CONTROLLER_BUTTON_DPAD_DOWN); dirty = true; }
+        if (pressed & DIR_LEFT) { dispatch_button(SDL_CONTROLLER_BUTTON_DPAD_LEFT); dirty = true; }
+        if (pressed & DIR_RIGHT) { dispatch_button(SDL_CONTROLLER_BUTTON_DPAD_RIGHT); dirty = true; }
+
+        if (flash_poll()) dirty = true;
+        reading = !menuMode && !overlay;
+        if (reading) {
+            if (flashPid) { if (scrollY) { scrollY = 0; dirty = true; } }
+            else {
+                int dir = ((h & DIR_DOWN) ? 1 : 0) - ((h & DIR_UP) ? 1 : 0);
+                if (dir) {
+                    int step = (int)(dt * 0.45f + 0.5f);
+                    scrollY += dir * (step < 1 ? 1 : step);
+                    int ms = max_scroll();
+                    if (scrollY < 0) scrollY = 0;
+                    if (scrollY > ms) scrollY = ms;
+                    dirty = true;
+                }
+                animate(&dirty);
+            }
+        }
+        if (toastUntil && now < toastUntil + 50) dirty = true;
         if (dirty) {
             if (menuMode) draw_library();
             else { draw_page(); if (overlay == 1) draw_links(); else if (overlay == 2) draw_goto(); }
             draw_tabbar();
+            if (flashPid && !menuMode) draw_flash_strip();
             draw_toast();
             SDL_RenderPresent(ren);
             dirty = false;
+            if (wantFullscreenFix) { wantFullscreenFix = false; sway_cmd("[pid=%d] fullscreen enable", (int)getpid()); }
         }
-        if (autoRequest) {                       /* Flash autoplay: page was shown, now run the flash */
+        if (autoRequest) {                           /* Flash autoplay: the page is shown, now start the flash */
             autoRequest = false;
             if (!menuMode && !overlay && has_kind(1)) { play_external(1); dirty = true; }
         }
-        SDL_Delay(8);
+        SDL_Delay(flashPid ? 30 : 8);
     }
 
+    flash_stop();
     save_tabs();
     video_shutdown();
     TTF_Quit();
