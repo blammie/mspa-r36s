@@ -8,7 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y gcc make libsdl2-dev libsdl2-ttf-dev libstb-dev
+        run: sudo apt-get update && sudo apt-get install -y gcc make libsdl2-dev libsdl2-ttf-dev libstb-dev zlib1g-dev
       - name: Compile
         run: make
       - name: Collect binary and libraries
