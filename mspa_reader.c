@@ -198,8 +198,9 @@ static int logBtnY, logBtnW, logBoxTop, logBoxBottom;
 static char logLabel[40];
 static char toastMsg[200];
 static uint32_t toastUntil;
-typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB; } Settings;
-static Settings cfg = {55, 1, false, true, false};   /* imgPct: 30..150, 999 = fit column width */
+typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB;
+                 int scrollSpeed; bool animGifs; bool smooth; bool linkNewTab; bool startMenu; } Settings;
+static Settings cfg = {55, 1, false, true, false, 1, true, true, true, false};   /* imgPct: 30..150, 999 = fit column width */
 static uint8_t *visitedBits[2];
 static bool logOpen, logPresent, autoRequest, g_noAuto, g_logs;
 static bool selectHeld;
@@ -666,8 +667,8 @@ static void page_free(Page *p) { free(p->html); p->html = NULL; p->valid = false
 static void settings_save(void) {
     FILE *f = fopen("conf/settings.txt", "w");
     if (!f) return;
-    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\n",
-            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB);
+    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nscrollspeed=%d\nanimgifs=%d\nsmooth=%d\nlinknewtab=%d\nstartmenu=%d\n",
+            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.scrollSpeed, cfg.animGifs, cfg.smooth, cfg.linkNewTab, cfg.startMenu);
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -680,9 +681,14 @@ static void settings_load(void) {
         int v;
         if (sscanf(line, "imgpct=%d", &v) == 1) cfg.imgPct = v >= 999 ? 999 : v < 30 ? 30 : v > 150 ? 150 : v;
         else if (sscanf(line, "textsize=%d", &v) == 1) cfg.textSize = v < 0 ? 0 : v > 2 ? 2 : v;
+        else if (sscanf(line, "scrollspeed=%d", &v) == 1) cfg.scrollSpeed = v < 0 ? 0 : v > 2 ? 2 : v;
         else if (sscanf(line, "autoflash=%d", &v) == 1) cfg.autoFlash = v != 0;
         else if (sscanf(line, "collapselogs=%d", &v) == 1) cfg.collapseLogs = v != 0;
         else if (sscanf(line, "swapab=%d", &v) == 1) cfg.swapAB = v != 0;
+        else if (sscanf(line, "animgifs=%d", &v) == 1) cfg.animGifs = v != 0;
+        else if (sscanf(line, "smooth=%d", &v) == 1) cfg.smooth = v != 0;
+        else if (sscanf(line, "linknewtab=%d", &v) == 1) cfg.linkNewTab = v != 0;
+        else if (sscanf(line, "startmenu=%d", &v) == 1) cfg.startMenu = v != 0;
     }
     free(s);
 }
@@ -1113,7 +1119,7 @@ static SDL_Texture *tex_from_rgba(const uint8_t *px, int w, int h) {
     if (!t) return NULL;
     SDL_UpdateTexture(t, NULL, px, w * 4);
     SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureScaleMode(t, SDL_ScaleModeLinear);
+    SDL_SetTextureScaleMode(t, cfg.smooth ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
     return t;
 }
 
@@ -1374,7 +1380,7 @@ static void build_page(void) {
         if (i + 1 < nf) { item_add(fFoot, " | ", C_BLACK, fx, y); fx += sw; }
     }
     y += fs + 6;
-    const char *r1 = "Auto-Saved!", *r2 = " | L1/R1: 10 pages";
+    const char *r1 = "Auto-Saved!", *r2 = " | L1/R1: back/next";
     int w1 = 0, w2 = 0;
     TTF_SizeUTF8(fFootU, r1, &w1, NULL);
     TTF_SizeUTF8(fFoot, r2, &w2, NULL);
@@ -1449,6 +1455,7 @@ static void open_page(const char *key, bool push) {
     logOpen = !cfg.collapseLogs;
     build_page();
     if (srcs[CT.src].kind == SK_STORY) mark_visited(srcs[CT.src].sect, page.id);
+    if (page.nnext > 1) toast("%d choices: Left/Right to pick, A to go", page.nnext);
     autoRequest = cfg.autoFlash && has_kind(1) && !g_noAuto;
     g_noAuto = false;
     snprintf(CT.key, sizeof CT.key, "%s", page.id);
@@ -1470,30 +1477,6 @@ static void go_prev(void) {
     if (CT.nHist > 0) { snprintf(k, sizeof k, "%s", CT.hist[--CT.nHist]); open_page(k, false); return; }
     if (page.prev[0]) { snprintf(k, sizeof k, "%s", page.prev); open_page(k, false); }
     g_noAuto = false;
-}
-
-static void jump(int steps) {
-    if (!havePage) return;
-    char id[24];
-    snprintf(id, sizeof id, "%s", page.id);
-    if (srcs[CT.src].kind != SK_STORY) {
-        int n = src_count(CT.src), idx = atoi(id) + steps;
-        if (idx < 0) idx = 0;
-        if (idx >= n) idx = n - 1;
-        snprintf(id, sizeof id, "%d", idx);
-    } else {
-        for (int i = 0; i < (steps < 0 ? -steps : steps); i++) {
-            Page t;
-            memset(&t, 0, sizeof t);
-            if (!story_load(srcs[CT.src].sect, id, &t)) break;
-            char tmp[24];
-            snprintf(tmp, sizeof tmp, "%s", steps > 0 ? (t.nnext ? t.next[0] : "") : t.prev);
-            page_free(&t);
-            if (!tmp[0]) break;
-            snprintf(id, sizeof id, "%s", tmp);
-        }
-    }
-    if (strcmp(id, page.id) != 0) open_page(id, true);
 }
 
 /* ------------------------------------------------------------- tabs */
@@ -1963,68 +1946,95 @@ static const char *img_label(char *buf, size_t n) {
     return buf;
 }
 
+enum { S_IMG, S_TEXT, S_SCROLL, S_AUTO, S_LOGS, S_GIF, S_SMOOTH, S_LINK, S_START, S_SWAP, S_CLEAR, S_BACK, S_COUNT };
+
 static void draw_settings(void) {
     fill(C_BG, 0, 0, SCR_W, SCR_H);
     fill(C_PANEL, PNL_X, TB, PNL_W, VIEW_H);
     fill(C_COL, COL_X, TB + COL_TOP, COL_W, VIEW_H - COL_TOP);
     int top = TB + COL_TOP;
-    draw_center(fTitle, "Settings", top + 6, C_BLACK);
-    char v[7][48], ib[24];
-    static const char *tsz[] = {"Small", "Medium", "Large"};
-    snprintf(v[0], 48, "< %s >", img_label(ib, sizeof ib));
-    snprintf(v[1], 48, "< %s >", tsz[cfg.textSize]);
-    snprintf(v[2], 48, "< %s >", cfg.autoFlash ? "On" : "Off");
-    snprintf(v[3], 48, "< %s >", cfg.collapseLogs ? "Collapsed" : "Shown");
-    snprintf(v[4], 48, "< %s >", cfg.swapAB ? "On" : "Off");
-    snprintf(v[5], 48, "A: clear");
-    v[6][0] = 0;
-    static const char *nm[] = {"Image size", "Text size", "Auto-play Flash pages", "Pesterlogs & other logs", "Swap A/B buttons", "Clear read history", "Back"};
-    static const char *ds[] = {"How big page art is drawn. Smaller = more text visible without scrolling.",
-                               "Page text size.", "Start a page's Flash automatically when you arrive on it.",
-                               "Start logs hidden behind a Show button, like the website.",
-                               "For controllers whose A/B are labelled the other way round.",
-                               "Forget which pages you've read (purple links).", ""};
-    for (int i = 0; i < 7; i++) {
-        int y = top + 46 + i * 42;
+    draw_center(fTitle, "Settings", top + 4, C_BLACK);
+    char v[S_COUNT][40], ib[24];
+    static const char *tsz[] = {"Small", "Medium", "Large"}, *spd[] = {"Slow", "Normal", "Fast"};
+    snprintf(v[S_IMG], 40, "< %s >", img_label(ib, sizeof ib));
+    snprintf(v[S_TEXT], 40, "< %s >", tsz[cfg.textSize]);
+    snprintf(v[S_SCROLL], 40, "< %s >", spd[cfg.scrollSpeed]);
+    snprintf(v[S_AUTO], 40, "< %s >", cfg.autoFlash ? "On" : "Off");
+    snprintf(v[S_LOGS], 40, "< %s >", cfg.collapseLogs ? "Collapsed" : "Shown");
+    snprintf(v[S_GIF], 40, "< %s >", cfg.animGifs ? "On" : "Off");
+    snprintf(v[S_SMOOTH], 40, "< %s >", cfg.smooth ? "Smooth" : "Sharp pixels");
+    snprintf(v[S_LINK], 40, "< %s >", cfg.linkNewTab ? "New tab" : "This tab");
+    snprintf(v[S_START], 40, "< %s >", cfg.startMenu ? "Main menu" : "Resume tabs");
+    snprintf(v[S_SWAP], 40, "< %s >", cfg.swapAB ? "On" : "Off");
+    snprintf(v[S_CLEAR], 40, "A: clear");
+    v[S_BACK][0] = 0;
+    static const char *nm[S_COUNT] = {"Image size", "Text size", "Scroll speed", "Auto-play Flash pages", "Pesterlogs & other logs", "Animate GIFs",
+                                      "Image scaling", "Links open in", "On start", "Swap A/B buttons", "Clear read history", "Back"};
+    static const char *ds[S_COUNT] = {"How big page art is drawn. Smaller = more text visible without scrolling.",
+        "Page text size.", "How fast Up/Down scrolls a page.", "Start a page's Flash automatically when you arrive on it.",
+        "Start logs hidden behind a Show button, like the website.", "Off = still pictures (smoother on slow devices).",
+        "Sharp pixels keeps pixel art crisp; Smooth blurs it slightly when resized.", "Where links from the link list (Start) open when you press A.",
+        "Resume the tabs you had open, or always start at the main menu.", "For controllers whose A/B are labelled the other way round.",
+        "Forget which pages you've read (purple links).", ""};
+    int rows = 9, first = setSel - rows / 2;
+    if (first + rows > S_COUNT) first = S_COUNT - rows;
+    if (first < 0) first = 0;
+    for (int r = 0; r < rows && first + r < S_COUNT; r++) {
+        int i = first + r, y = top + 40 + r * 36;
         bool sel = i == setSel;
-        if (sel) fill(C_HILITE, COL_X + 6, y - 4, COL_W - 12, 40);
+        if (sel) fill(C_HILITE, COL_X + 6, y - 3, COL_W - 12, 34);
         draw_str(sel ? fLink : fMenu, nm[i], COL_X + PAD, y, sel ? C_LINK : C_BLACK);
         draw_right(fMenu, v[i], COL_X + COL_W - PAD, y, C_BLACK);
     }
+    if (first > 0) draw_str(fFoot, "^ more", COL_X + COL_W - 70, top + 6, C_GREY);
+    if (first + rows < S_COUNT) draw_str(fFoot, "v more", COL_X + COL_W - 70, top + 40 + rows * 36 - 2, C_GREY);
     if (ds[setSel][0]) {
         char fit[260];
         fit_text(fFoot, ds[setSel], COL_W - 2 * PAD, fit, sizeof fit);
-        draw_str(fFoot, fit, COL_X + PAD, top + 46 + 7 * 42 + 2, C_GREY);
+        draw_str(fFoot, fit, COL_X + PAD, SCR_H - 48, C_GREY);
     }
     draw_center(fFoot, "Up/Down: choose  |  Left/Right or A: change  |  B: back", SCR_H - 24, C_GREY);
 }
 
 static void settings_adjust(int dir) {
     switch (setSel) {
-    case 0:
+    case S_IMG:
         if (cfg.imgPct >= 999) { if (dir < 0) cfg.imgPct = 150; }
         else { cfg.imgPct += dir * 5; if (cfg.imgPct < 30) cfg.imgPct = 30; if (cfg.imgPct > 150) cfg.imgPct = 999; }
         break;
-    case 1: cfg.textSize += dir; if (cfg.textSize < 0) cfg.textSize = 0; if (cfg.textSize > 2) cfg.textSize = 2; break;
-    case 2: cfg.autoFlash = !cfg.autoFlash; break;
-    case 3: cfg.collapseLogs = !cfg.collapseLogs; break;
-    case 4: cfg.swapAB = !cfg.swapAB; break;
-    case 5: if (dir == 0) { visited_clear(); toast("Read history cleared"); } return;
+    case S_TEXT: cfg.textSize += dir; if (cfg.textSize < 0) cfg.textSize = 0; if (cfg.textSize > 2) cfg.textSize = 2; break;
+    case S_SCROLL: cfg.scrollSpeed += dir; if (cfg.scrollSpeed < 0) cfg.scrollSpeed = 0; if (cfg.scrollSpeed > 2) cfg.scrollSpeed = 2; break;
+    case S_AUTO: cfg.autoFlash = !cfg.autoFlash; break;
+    case S_LOGS: cfg.collapseLogs = !cfg.collapseLogs; break;
+    case S_GIF: cfg.animGifs = !cfg.animGifs; break;
+    case S_SMOOTH: cfg.smooth = !cfg.smooth; break;
+    case S_LINK: cfg.linkNewTab = !cfg.linkNewTab; break;
+    case S_START: cfg.startMenu = !cfg.startMenu; break;
+    case S_SWAP: cfg.swapAB = !cfg.swapAB; break;
+    case S_CLEAR: if (dir == 0) { visited_clear(); toast("Read history cleared"); } return;
     default: return;
     }
     settings_save();
-    if (setSel == 1) apply_text_size();
-    else if (setSel == 3) { logOpen = !cfg.collapseLogs; rebuild_layout(); }
-    else if (setSel == 0) rebuild_layout();
+    if (setSel == S_TEXT) apply_text_size();
+    else if (setSel == S_LOGS) { logOpen = !cfg.collapseLogs; rebuild_layout(); }
+    else if (setSel == S_IMG) rebuild_layout();
+    else if (setSel == S_SMOOTH && havePage) {           /* textures are made with the scaling mode: reload the page */
+        char k[24];
+        snprintf(k, sizeof k, "%s", page.id);
+        int sc = scrollY;
+        g_noAuto = true;
+        open_page(k, false);
+        scrollY = sc > max_scroll() ? max_scroll() : sc;
+    }
 }
 
 static void handle_settings(int b) {
-    if (b == SDL_CONTROLLER_BUTTON_B || (b == SDL_CONTROLLER_BUTTON_A && setSel == 6)) { libLevel = 0; return; }
+    if (b == SDL_CONTROLLER_BUTTON_B || (b == SDL_CONTROLLER_BUTTON_A && setSel == S_BACK)) { libLevel = 0; return; }
     if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && setSel > 0) setSel--;
-    if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && setSel < 6) setSel++;
+    if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && setSel < S_COUNT - 1) setSel++;
     if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT) settings_adjust(-1);
     if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) settings_adjust(1);
-    if (b == SDL_CONTROLLER_BUTTON_A) settings_adjust(setSel == 5 ? 0 : 1);
+    if (b == SDL_CONTROLLER_BUTTON_A) settings_adjust(setSel == S_CLEAR ? 0 : 1);
 }
 
 static void draw_controls(void) {
@@ -2042,9 +2052,11 @@ static void draw_controls(void) {
         {"Select+X", "Show/hide the log (on flash pages)"},
         {"Start / L3", "Links on this page"},
         {"R3", "Go to a page number"},
-        {"L1 / R1", "Jump 10 pages back / forward"},
+        {"L1 / R1", "Back / next page"},
         {"L2 / R2", "Previous / next tab"},
-        {"D-pad, sticks", "Up/Down scroll; Left/Right pick a link"},
+        {"Select+A", "Open this page in a new tab"},
+        {"Select+B", "Close this tab (not the last)"},
+        {"D-pad, sticks", "Up/Down scroll; Left/Right pick a command"},
         {"MENUS", ""},
         {"A / Y", "Open here / in a new tab"},
         {"Start / R3", "Close the current tab"},
@@ -2181,7 +2193,8 @@ static void draw_links(void) {
     fit_text(fFoot, links[selLink].url, pw - 24, url, sizeof url);
     draw_str(fFoot, url, px + 12, py + ph - 52, C_GREY);
     draw_str(fFoot, links[selLink].kind == LK_WEB ? "Web links can't be opened on this device   |   B: close"
-                                                  : "A: open in new tab   |   Y: open in this tab   |   B: close",
+                                                  : cfg.linkNewTab ? "A: open in new tab   |   Y: open in this tab   |   B: close"
+                                                                    : "A: open in this tab   |   Y: open in new tab   |   B: close",
              px + 12, py + ph - 28, C_BLACK);
 }
 
@@ -2214,7 +2227,9 @@ static void draw_toast(void) {
     draw_str(fFoot, fit, (SCR_W - w) / 2, SCR_H - 38, C_CARDTXT);
 }
 
+/* ------------------------------------------------------------- input */
 static void animate(bool *dirty) {
+    if (!cfg.animGifs) return;
     uint32_t now = SDL_GetTicks();
     for (int i = 0; i < nMedia; i++) {
         Media *m = &media[i];
@@ -2225,11 +2240,11 @@ static void animate(bool *dirty) {
             SDL_UpdateTexture(m->tex, NULL, m->gif->canvas, m->w * 4);
             m->nextTick = now + (uint32_t)m->gif->delay_ms;
             *dirty = true;
+            return;                      /* one decode per frame */
         }
     }
 }
 
-/* ------------------------------------------------------------- input */
 static void open_library(void) {
     save_tabs();
     menuMode = true;
@@ -2303,8 +2318,16 @@ static void handle_links(int b) {
     if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_LEFTSTICK || b == SDL_CONTROLLER_BUTTON_START) { overlay = 0; return; }
     if (b == SDL_CONTROLLER_BUTTON_DPAD_UP && selLink > 0) selLink--;
     if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN && selLink + 1 < nLinks) selLink++;
-    if (b == SDL_CONTROLLER_BUTTON_A) { int i = selLink; overlay = 0; open_link(i, true); }
-    if (b == SDL_CONTROLLER_BUTTON_Y) { int i = selLink; overlay = 0; open_link(i, false); }
+    if (b == SDL_CONTROLLER_BUTTON_A) { int i = selLink; overlay = 0; open_link(i, cfg.linkNewTab); }
+    if (b == SDL_CONTROLLER_BUTTON_Y) { int i = selLink; overlay = 0; open_link(i, !cfg.linkNewTab); }
+}
+
+static void show_choice(void) {                          /* scroll so the chosen command is visible */
+    int top = choiceTop[selChoice] - 10, bot = choiceBot[selChoice] + 10;
+    if (top < scrollY) scrollY = top;
+    else if (bot > scrollY + VIEW_H) scrollY = bot - VIEW_H;
+    if (scrollY > max_scroll()) scrollY = max_scroll();
+    if (scrollY < 0) scrollY = 0;
 }
 
 static void toggle_log(void) {
@@ -2315,12 +2338,18 @@ static void toggle_log(void) {
 
 static void handle_reading(int b) {
     switch (b) {
-    case SDL_CONTROLLER_BUTTON_A: go_next(); break;
-    case SDL_CONTROLLER_BUTTON_B: go_prev(); break;
-    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: jump(-10); break;
-    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: jump(10); break;
-    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: if (page.nnext > 1 && selChoice > 0) selChoice--; break;
-    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: if (page.nnext > 1 && selChoice + 1 < page.nnext) selChoice++; break;
+    case SDL_CONTROLLER_BUTTON_A:
+        if (selectHeld) tab_new(CT.src, page.id);          /* Select+A: this page in a new tab */
+        else go_next();
+        break;
+    case SDL_CONTROLLER_BUTTON_B:
+        if (selectHeld) tab_close_current();               /* Select+B: close this tab */
+        else go_prev();
+        break;
+    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: go_prev(); break;
+    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: go_next(); break;
+    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: if (page.nnext > 1 && selChoice > 0) { selChoice--; show_choice(); } break;
+    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: if (page.nnext > 1 && selChoice + 1 < page.nnext) { selChoice++; show_choice(); } break;
     case SDL_CONTROLLER_BUTTON_Y:
         if (has_kind(1)) play_external(1);
         else if (has_kind(3)) play_external(3);
@@ -2418,7 +2447,7 @@ int main(int argc, char **argv) {
     draw_center(fTitle, "Loading...", SCR_H / 2 - 12, C_CARDTXT);
     SDL_RenderPresent(ren);
 
-    if (load_data()) { bm_load(); build_menu(); restore_tabs(); }
+    if (load_data()) { bm_load(); build_menu(); if (!cfg.startMenu) restore_tabs(); }
 
     bool running = true, dirty = true, trigL = false, trigR = false;
     uint32_t last = SDL_GetTicks();
@@ -2497,7 +2526,8 @@ int main(int argc, char **argv) {
             {
                 int dir = ((h & DIR_DOWN) ? 1 : 0) - ((h & DIR_UP) ? 1 : 0);
                 if (dir) {
-                    int step = (int)(dt * 0.45f + 0.5f);
+                    static const float speed[3] = {0.28f, 0.45f, 0.75f};
+                    int step = (int)((dt > 24 ? 24 : dt) * speed[cfg.scrollSpeed] + 0.5f);
                     scrollY += dir * (step < 1 ? 1 : step);
                     int ms = max_scroll();
                     if (scrollY < 0) scrollY = 0;
