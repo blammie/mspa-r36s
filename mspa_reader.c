@@ -78,6 +78,8 @@ static const SDL_Color C_TABOFF = {75, 75, 75, 255};
 static const SDL_Color C_HILITE = {255, 247, 190, 255};
 static const SDL_Color C_VISITED = {85, 26, 139, 255};
 static const SDL_Color C_WHITE = {250, 250, 250, 255};
+static const SDL_Color C_SELECT = {40, 110, 220, 255};   /* "selected text" blue behind light text */
+static const SDL_Color C_DARKBOX = {20, 20, 20, 255};
 
 /* ---------------------------------------------------------------- types */
 typedef struct { const char *k; uint32_t l; const JNode *n; } Key;
@@ -132,6 +134,8 @@ typedef struct {
     TTF_Font *font;
     int x, y, w, h;
     SDL_Texture *tex;
+    uint8_t bg;      /* 0 none, 1 blue highlight, 2 dark box (light text on the pale column) */
+    int bgH;
 } Item;
 
 enum { LK_PAGE, LK_ASSET, LK_TSO, LK_WEB };
@@ -199,8 +203,9 @@ static char logLabel[40];
 static char toastMsg[200];
 static uint32_t toastUntil;
 typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB;
-                 int scrollSpeed; bool animGifs; bool smooth; bool linkNewTab; bool startMenu; } Settings;
-static Settings cfg = {55, 1, false, true, false, 1, true, true, true, false};   /* imgPct: 30..150, 999 = fit column width */
+                 int scrollSpeed; bool animGifs; bool smooth; bool linkNewTab; bool startMenu;
+                 int lightText; } Settings;   /* lightText: 0 blue highlight, 1 dark box, 2 gray, 3 darkened */
+static Settings cfg = {55, 1, false, true, false, 1, true, true, true, false, 0};   /* imgPct: 30..150, 999 = fit column width */
 static uint8_t *visitedBits[2];
 static bool logOpen, logPresent, autoRequest, g_noAuto, g_logs;
 static bool selectHeld;
@@ -667,8 +672,8 @@ static void page_free(Page *p) { free(p->html); p->html = NULL; p->valid = false
 static void settings_save(void) {
     FILE *f = fopen("conf/settings.txt", "w");
     if (!f) return;
-    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nscrollspeed=%d\nanimgifs=%d\nsmooth=%d\nlinknewtab=%d\nstartmenu=%d\n",
-            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.scrollSpeed, cfg.animGifs, cfg.smooth, cfg.linkNewTab, cfg.startMenu);
+    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nscrollspeed=%d\nanimgifs=%d\nsmooth=%d\nlinknewtab=%d\nstartmenu=%d\nlighttext=%d\n",
+            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.scrollSpeed, cfg.animGifs, cfg.smooth, cfg.linkNewTab, cfg.startMenu, cfg.lightText);
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -689,6 +694,7 @@ static void settings_load(void) {
         else if (sscanf(line, "smooth=%d", &v) == 1) cfg.smooth = v != 0;
         else if (sscanf(line, "linknewtab=%d", &v) == 1) cfg.linkNewTab = v != 0;
         else if (sscanf(line, "startmenu=%d", &v) == 1) cfg.startMenu = v != 0;
+        else if (sscanf(line, "lighttext=%d", &v) == 1) cfg.lightText = v < 0 ? 0 : v > 3 ? 3 : v;
     }
     free(s);
 }
@@ -812,6 +818,10 @@ static void item_add(TTF_Font *f, const char *text, SDL_Color c, int x, int y) {
     it->x = x;
     it->y = y;
     TTF_SizeUTF8(f, text, &it->w, &it->h);
+    if (g_logs && cfg.lightText <= 1 && c.r + c.g + c.b > 560) {   /* page text only (g_logs is set while it is laid out) */
+        it->bg = (uint8_t)(cfg.lightText + 1);
+        it->bgH = TTF_FontLineSkip(f);
+    }
 }
 
 typedef struct { char *w; SDL_Color c; bool glue; } Tok;
@@ -876,8 +886,11 @@ static void tok_add(TTF_Font *f, const char *word, SDL_Color c, bool glue, int b
     lineW += add + w;
 }
 
-static SDL_Color fix_color(SDL_Color c) {
-    if (c.r + c.g + c.b > 560) { c.r = c.g = c.b = 90; }
+static SDL_Color fix_color(SDL_Color c) {                 /* light text on the pale column: see Settings > Light-coloured text */
+    if (c.r + c.g + c.b > 560) {
+        if (cfg.lightText == 2) c.r = c.g = c.b = 165;           /* light gray */
+        else if (cfg.lightText == 3) c.r = c.g = c.b = 90;       /* darkened */
+    }
     return c;
 }
 
@@ -1946,7 +1959,7 @@ static const char *img_label(char *buf, size_t n) {
     return buf;
 }
 
-enum { S_IMG, S_TEXT, S_SCROLL, S_AUTO, S_LOGS, S_GIF, S_SMOOTH, S_LINK, S_START, S_SWAP, S_CLEAR, S_BACK, S_COUNT };
+enum { S_IMG, S_TEXT, S_SCROLL, S_AUTO, S_LOGS, S_LIGHT, S_GIF, S_SMOOTH, S_LINK, S_START, S_SWAP, S_CLEAR, S_BACK, S_COUNT };
 
 static void draw_settings(void) {
     fill(C_BG, 0, 0, SCR_W, SCR_H);
@@ -1961,6 +1974,7 @@ static void draw_settings(void) {
     snprintf(v[S_SCROLL], 40, "< %s >", spd[cfg.scrollSpeed]);
     snprintf(v[S_AUTO], 40, "< %s >", cfg.autoFlash ? "On" : "Off");
     snprintf(v[S_LOGS], 40, "< %s >", cfg.collapseLogs ? "Collapsed" : "Shown");
+    snprintf(v[S_LIGHT], 40, "< %s >", cfg.lightText == 0 ? "Blue highlight" : cfg.lightText == 1 ? "Dark box" : cfg.lightText == 2 ? "Light gray" : "Darkened");
     snprintf(v[S_GIF], 40, "< %s >", cfg.animGifs ? "On" : "Off");
     snprintf(v[S_SMOOTH], 40, "< %s >", cfg.smooth ? "Smooth" : "Sharp pixels");
     snprintf(v[S_LINK], 40, "< %s >", cfg.linkNewTab ? "New tab" : "This tab");
@@ -1968,11 +1982,12 @@ static void draw_settings(void) {
     snprintf(v[S_SWAP], 40, "< %s >", cfg.swapAB ? "On" : "Off");
     snprintf(v[S_CLEAR], 40, "A: clear");
     v[S_BACK][0] = 0;
-    static const char *nm[S_COUNT] = {"Image size", "Text size", "Scroll speed", "Auto-play Flash pages", "Pesterlogs & other logs", "Animate GIFs",
+    static const char *nm[S_COUNT] = {"Image size", "Text size", "Scroll speed", "Auto-play Flash pages", "Pesterlogs & other logs", "Light-coloured text", "Animate GIFs",
                                       "Image scaling", "Links open in", "On start", "Swap A/B buttons", "Clear read history", "Back"};
     static const char *ds[S_COUNT] = {"How big page art is drawn. Smaller = more text visible without scrolling.",
         "Page text size.", "How fast Up/Down scrolls a page.", "Start a page's Flash automatically when you arrive on it.",
-        "Start logs hidden behind a Show button, like the website.", "Off = still pictures (smoother on slow devices).",
+        "Start logs hidden behind a Show button, like the website.",
+        "White text (Doctor Scratch etc.): blue highlight, dark box, light gray, or darkened.", "Off = still pictures (smoother on slow devices).",
         "Sharp pixels keeps pixel art crisp; Smooth blurs it slightly when resized.", "Where links from the link list (Start) open when you press A.",
         "Resume the tabs you had open, or always start at the main menu.", "For controllers whose A/B are labelled the other way round.",
         "Forget which pages you've read (purple links).", ""};
@@ -2006,6 +2021,7 @@ static void settings_adjust(int dir) {
     case S_SCROLL: cfg.scrollSpeed += dir; if (cfg.scrollSpeed < 0) cfg.scrollSpeed = 0; if (cfg.scrollSpeed > 2) cfg.scrollSpeed = 2; break;
     case S_AUTO: cfg.autoFlash = !cfg.autoFlash; break;
     case S_LOGS: cfg.collapseLogs = !cfg.collapseLogs; break;
+    case S_LIGHT: cfg.lightText = (cfg.lightText + dir + 4) % 4; break;
     case S_GIF: cfg.animGifs = !cfg.animGifs; break;
     case S_SMOOTH: cfg.smooth = !cfg.smooth; break;
     case S_LINK: cfg.linkNewTab = !cfg.linkNewTab; break;
@@ -2017,7 +2033,7 @@ static void settings_adjust(int dir) {
     settings_save();
     if (setSel == S_TEXT) apply_text_size();
     else if (setSel == S_LOGS) { logOpen = !cfg.collapseLogs; rebuild_layout(); }
-    else if (setSel == S_IMG) rebuild_layout();
+    else if (setSel == S_IMG || setSel == S_LIGHT) rebuild_layout();
     else if (setSel == S_SMOOTH && havePage) {           /* textures are made with the scaling mode: reload the page */
         char k[24];
         snprintf(k, sizeof k, "%s", page.id);
@@ -2145,6 +2161,7 @@ static void draw_page(void) {
             if (it->tex && (it->y + it->h < scrollY - 1500 || it->y > scrollY + VIEW_H + 1500)) { SDL_DestroyTexture(it->tex); it->tex = NULL; }
             continue;
         }
+        if (it->bg) fill(it->bg == 1 ? C_SELECT : C_DARKBOX, COL_X + it->x - 3, it->y + oy, it->w + 6, it->bgH);
         if (!it->tex) {
             SDL_Surface *sf = TTF_RenderUTF8_Blended(it->font, it->text, it->col);
             if (!sf) continue;
