@@ -114,6 +114,7 @@ typedef struct {
     int nnext;
     char prev[24];
     bool valid;
+    bool locked;      /* TZPASSWORD page: needs its password before moving on */
 } Page;
 
 typedef struct {
@@ -138,7 +139,7 @@ typedef struct {
     int bgH;
 } Item;
 
-enum { LK_PAGE, LK_ASSET, LK_TSO, LK_WEB };
+enum { LK_PAGE, LK_ASSET, LK_TSO, LK_WV, LK_WEB };
 typedef struct {
     char url[300];
     char label[100];
@@ -165,8 +166,8 @@ static char assets[512] = "";
 static char loadError[256];
 static char *jsonBuf, *comicsBuf;
 static JNode *jroot, *croot;
-static Section sect[2];
-static const char *SECT_NAMES[2] = {"story", "ryanquest"};
+static Section sect[3];
+static const char *SECT_NAMES[3] = {"story", "ryanquest", "wv"};
 
 static Source *srcs;
 static int nSrcs, capSrcs;
@@ -204,8 +205,8 @@ static char toastMsg[200];
 static uint32_t toastUntil;
 typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB;
                  int scrollSpeed; bool animGifs; bool smooth; bool linkNewTab; bool startMenu;
-                 int lightText; } Settings;   /* lightText: 0 blue highlight, 1 dark box, 2 gray, 3 darkened */
-static Settings cfg = {55, 1, false, true, false, 1, true, true, true, false, 0};   /* imgPct: 30..150, 999 = fit column width */
+                 int lightText; bool pageNums; } Settings;   /* lightText: 0 blue highlight, 1 dark box, 2 gray, 3 darkened */
+static Settings cfg = {55, 1, false, true, false, 1, true, true, true, false, 0, false};   /* imgPct: 30..150, 999 = fit column width */
 static uint8_t *visitedBits[2];
 static bool logOpen, logPresent, autoRequest, g_noAuto, g_logs;
 static bool selectHeld;
@@ -217,6 +218,11 @@ typedef struct { int type, a; } MItem;
 static MItem menu[48];
 static int nMenu, selMenu, menuScroll;
 static bool g_links, g_inl;
+static char unlockedIds[32][24];
+static int nUnlocked;
+static char pwBuf[32];
+static int pwLen, kbR, kbC;
+static int redrawFrames;
 static int curLinkIdx = -1;
 
 typedef struct { const char *name, *tag; int sect; const char *start; } Story;
@@ -224,6 +230,7 @@ static const Story STORIES[] = {
     {"Jailbreak", "JB", 0, "000002"},      {"Bard Quest", "BQ", 0, "000136"},
     {"Problem Sleuth", "PS", 0, "000219"}, {"Homestuck Beta", "HSB", 0, "001893"},
     {"Homestuck", "HS", 0, "001901"},      {"Ryanquest", "RQ", 1, "000001"},
+    {"Wayward Vagabond", "WV", 2, "anunsealedtunnel"},
 };
 #define NSTORIES ((int)(sizeof STORIES / sizeof STORIES[0]))
 
@@ -559,8 +566,9 @@ static bool load_data(void) {
     if (!jsonBuf) { snprintf(loadError, sizeof loadError, "Cannot read %.200s", path); return false; }
     jroot = json_parse(jsonBuf, n);
     if (!jroot) { snprintf(loadError, sizeof loadError, "mspa.json could not be parsed"); return false; }
-    for (int s = 0; s < 2; s++) {
+    for (int s = 0; s < 3; s++) {
         const JNode *o = jget(jroot, SECT_NAMES[s]);
+        if (!o && s == 2) { sect[2].keys = NULL; sect[2].n = 0; continue; }   /* Wayward Vagabond is optional */
         if (!o) { snprintf(loadError, sizeof loadError, "mspa.json has no \"%s\" section", SECT_NAMES[s]); return false; }
         sect[s].keys = malloc(sizeof(Key) * (o->count ? o->count : 1));
         sect[s].n = 0;
@@ -580,6 +588,10 @@ static bool load_data(void) {
 }
 
 /* ------------------------------------------------------------ page load */
+static const char *WV_ORDER[] = {"anunsealedtunnel", "windsdownsideways", "beneaththegleam", "recordsastutteringstep",
+                                 "asentrywakens", "anagitatedfinger", "astudiouseye", "preparesforcompany"};
+#define NWV ((int)(sizeof WV_ORDER / sizeof WV_ORDER[0]))
+
 static bool story_load(int s, const char *id, Page *p) {
     memset(p, 0, sizeof *p);
     const JNode *n = find_page(s, id);
@@ -600,6 +612,16 @@ static bool story_load(int s, const char *id, Page *p) {
     }
     char *pv = jdup(jget(n, "previous"));
     if (pv) { snprintf(p->prev, sizeof p->prev, "%s", pv); free(pv); }
+    if (s == 2) {                                  /* Wayward Vagabond: no links in the data, use the story order */
+        for (int i = 0; i < NWV; i++) {
+            if (strcmp(WV_ORDER[i], id) != 0) continue;
+            if (i + 1 < NWV) { snprintf(p->next[0], 24, "%s", WV_ORDER[i + 1]); p->nnext = 1; }
+            if (i > 0) snprintf(p->prev, sizeof p->prev, "%s", WV_ORDER[i - 1]);
+        }
+    }
+    const JNode *fl = jget(n, "flag");
+    for (const JNode *c = fl ? fl->child : NULL; c; c = c->next)
+        if (c->t == J_STR && c->len == 10 && !memcmp(c->s, "TZPASSWORD", 10)) p->locked = true;
     p->valid = true;
     return true;
 }
@@ -672,8 +694,8 @@ static void page_free(Page *p) { free(p->html); p->html = NULL; p->valid = false
 static void settings_save(void) {
     FILE *f = fopen("conf/settings.txt", "w");
     if (!f) return;
-    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nscrollspeed=%d\nanimgifs=%d\nsmooth=%d\nlinknewtab=%d\nstartmenu=%d\nlighttext=%d\n",
-            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.scrollSpeed, cfg.animGifs, cfg.smooth, cfg.linkNewTab, cfg.startMenu, cfg.lightText);
+    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nscrollspeed=%d\nanimgifs=%d\nsmooth=%d\nlinknewtab=%d\nstartmenu=%d\nlighttext=%d\npagenums=%d\n",
+            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.scrollSpeed, cfg.animGifs, cfg.smooth, cfg.linkNewTab, cfg.startMenu, cfg.lightText, cfg.pageNums);
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -695,6 +717,7 @@ static void settings_load(void) {
         else if (sscanf(line, "linknewtab=%d", &v) == 1) cfg.linkNewTab = v != 0;
         else if (sscanf(line, "startmenu=%d", &v) == 1) cfg.startMenu = v != 0;
         else if (sscanf(line, "lighttext=%d", &v) == 1) cfg.lightText = v < 0 ? 0 : v > 3 ? 3 : v;
+        else if (sscanf(line, "pagenums=%d", &v) == 1) cfg.pageNums = v != 0;
     }
     free(s);
 }
@@ -713,6 +736,22 @@ static bool vis_num(const char *id, int *n) {
     for (const char *c = id; *c; c++) if (!isdigit((unsigned char)*c)) return false;
     *n = atoi(id);
     return true;
+}
+
+/* story page number as the Collection counts it (Homestuck 001901 = page 1); 0 if not applicable */
+static int page_num(int si, const char *id) {
+    int v;
+    if (srcs[si].kind != SK_STORY || srcs[si].sect > 1 || !vis_num(id, &v)) return 0;
+    int st = atoi(srcs[si].start);
+    return v >= st ? v - st + 1 : 0;
+}
+
+static void page_label(int si, const char *key, char *out, size_t n) {
+    int pn = cfg.pageNums ? page_num(si, key) : 0;
+    if (pn) { snprintf(out, n, "%d", pn); return; }
+    const char *k = key;
+    if (srcs[si].kind == SK_STORY) while (*k == '0' && k[1]) k++;
+    snprintf(out, n, "%s", k);
 }
 
 static bool is_visited(int s, const char *id) {
@@ -737,6 +776,46 @@ static void mark_visited(int s, const char *id) {
     fputc(*b, f);
     fflush(f);
     fclose(f);
+}
+
+static bool is_unlocked(const char *id) {
+    for (int i = 0; i < nUnlocked; i++) if (!strcmp(unlockedIds[i], id)) return true;
+    return false;
+}
+
+static void unlock_page(const char *id) {
+    if (is_unlocked(id) || nUnlocked >= 32) return;
+    snprintf(unlockedIds[nUnlocked++], 24, "%s", id);
+    FILE *f = fopen("conf/unlocked.txt", "a");
+    if (!f) return;
+    fprintf(f, "%s\n", id);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+}
+
+static void unlocked_load(void) {
+    char *s = (char *)read_file("conf/unlocked.txt", NULL);
+    if (!s) return;
+    for (char *line = strtok(s, "\n"); line; line = strtok(NULL, "\n"))
+        if (nUnlocked < 32 && line[0]) snprintf(unlockedIds[nUnlocked++], 24, "%s", line);
+    free(s);
+}
+
+/* passwords.txt: "009058=thepassword" per line. Without an entry the typed text can't be checked. */
+static bool pw_expected(const char *id, char *out, size_t n) {
+    char *s = (char *)read_file("passwords.txt", NULL);
+    if (!s) return false;
+    bool found = false;
+    for (char *line = strtok(s, "\n"); line && !found; line = strtok(NULL, "\n")) {
+        line[strcspn(line, "\r")] = 0;
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq) continue;
+        *eq = 0;
+        if (!strcmp(line, id)) { snprintf(out, n, "%s", eq + 1); found = true; }
+    }
+    free(s);
+    return found;
 }
 
 static void visited_clear(void) {
@@ -801,6 +880,12 @@ static void items_clear(void) {
     nItems = 0;
 }
 
+static bool is_light(SDL_Color c) {            /* white / near-white gray (Doctor Scratch), not pastel colours */
+    int mx = c.r > c.g ? (c.r > c.b ? c.r : c.b) : (c.g > c.b ? c.g : c.b);
+    int mn = c.r < c.g ? (c.r < c.b ? c.r : c.b) : (c.g < c.b ? c.g : c.b);
+    return mn >= 185 && mx - mn <= 45;
+}
+
 static void item_add(TTF_Font *f, const char *text, SDL_Color c, int x, int y) {
     if (!text || !*text) return;
     if (nItems == capItems) {
@@ -818,7 +903,7 @@ static void item_add(TTF_Font *f, const char *text, SDL_Color c, int x, int y) {
     it->x = x;
     it->y = y;
     TTF_SizeUTF8(f, text, &it->w, &it->h);
-    if (g_logs && cfg.lightText <= 1 && c.r + c.g + c.b > 560) {   /* page text only (g_logs is set while it is laid out) */
+    if (g_logs && cfg.lightText <= 1 && is_light(c)) {   /* page text only (g_logs is set while it is laid out) */
         it->bg = (uint8_t)(cfg.lightText + 1);
         it->bgH = TTF_FontLineSkip(f);
     }
@@ -886,10 +971,10 @@ static void tok_add(TTF_Font *f, const char *word, SDL_Color c, bool glue, int b
     lineW += add + w;
 }
 
-static SDL_Color fix_color(SDL_Color c) {                 /* light text on the pale column: see Settings > Light-coloured text */
-    if (c.r + c.g + c.b > 560) {
-        if (cfg.lightText == 2) c.r = c.g = c.b = 165;           /* light gray */
-        else if (cfg.lightText == 3) c.r = c.g = c.b = 90;       /* darkened */
+static SDL_Color fix_color(SDL_Color c) {
+    if (is_light(c)) {
+        if (cfg.lightText == 2) c.r = c.g = c.b = 165;
+        else if (cfg.lightText == 3) c.r = c.g = c.b = 90;
     }
     return c;
 }
@@ -952,6 +1037,13 @@ static void classify_link(Link *lk) {
     char path[300];
     url_path(u, path, sizeof path);
     if (!strncmp(path, "/tso/", 5)) { snprintf(lk->target, sizeof lk->target, "%.250s", path + 5); lk->kind = LK_TSO; return; }
+    static const char WVP[] = "/storyfiles/hs2/waywardvagabond/";
+    if (!strncmp(path, WVP, sizeof WVP - 1)) {
+        char name[64];
+        snprintf(name, sizeof name, "%.60s", path + sizeof WVP - 1);
+        name[strcspn(name, "/")] = 0;
+        if (name[0] && find_page(2, name)) { snprintf(lk->target, sizeof lk->target, "%s", name); lk->kind = LK_WV; return; }
+    }
     const char *x = ext_of(path);
     if (!strcasecmp(x, "gif") || !strcasecmp(x, "png") || !strcasecmp(x, "jpg") || !strcasecmp(x, "jpeg") ||
         !strcasecmp(x, "swf") || !strcasecmp(x, "mp4")) {
@@ -1140,6 +1232,26 @@ static bool is_video_ext(const char *x) {
     return !strcasecmp(x, "mp4") || !strcasecmp(x, "webm") || !strcasecmp(x, "mkv") || !strcasecmp(x, "avi") || !strcasecmp(x, "mov");
 }
 
+static bool video_override(const char *swfPath, char *out, size_t n) {
+    static const char *ext[] = {"mp4", "webm", "mkv"};
+    char base[640], stem[128], cand[760], rp[4096];
+    snprintf(base, sizeof base, "%s", swfPath);
+    char *d = strrchr(base, '.');
+    if (d) *d = 0;
+    snprintf(stem, sizeof stem, "%.120s", base_of(base));
+    for (int e = 0; e < 3; e++) {
+        snprintf(cand, sizeof cand, "%s.%s", base, ext[e]);
+        if (file_exists(cand)) { snprintf(out, n, "%.600s", cand); return true; }
+        snprintf(cand, sizeof cand, "videos/%s.%s", stem, ext[e]);
+        if (file_exists(cand) && realpath(cand, rp)) { snprintf(out, n, "%.600s", rp); return true; }
+        if (nTabs > 0 && srcs[CT.src].kind == SK_STORY && page.id[0]) {
+            snprintf(cand, sizeof cand, "videos/%s.%s", page.id, ext[e]);
+            if (file_exists(cand) && realpath(cand, rp)) { snprintf(out, n, "%.600s", rp); return true; }
+        }
+    }
+    return false;
+}
+
 static void media_load(Media *m) {
     const char *ext = ext_of(m->rel);
     if (!strcasecmp(ext, "swf") || is_video_ext(ext)) {
@@ -1147,6 +1259,9 @@ static void media_load(Media *m) {
         if (!resolve_path(m->rel, m->path, sizeof m->path)) {
             m->kind = 2;
             snprintf(m->label, sizeof m->label, "[ File missing ]<br />%.200s", m->rel);
+        } else if (m->kind == 1) {
+            char vo[640];
+            if (video_override(m->path, vo, sizeof vo)) { snprintf(m->path, sizeof m->path, "%s", vo); m->kind = 3; }
         }
         return;
     }
@@ -1393,7 +1508,13 @@ static void build_page(void) {
         if (i + 1 < nf) { item_add(fFoot, " | ", C_BLACK, fx, y); fx += sw; }
     }
     y += fs + 6;
-    const char *r1 = "Auto-Saved!", *r2 = " | L1/R1: back/next";
+    char r2[80] = " | L1/R1: back/next";
+    const char *r1 = "Auto-Saved!";
+    if (srcs[CT.src].kind == SK_STORY) {
+        char lab[24];
+        page_label(CT.src, page.id, lab, sizeof lab);
+        snprintf(r2, sizeof r2, " | Page %s | L1/R1: back/next", lab);
+    }
     int w1 = 0, w2 = 0;
     TTF_SizeUTF8(fFootU, r1, &w1, NULL);
     TTF_SizeUTF8(fFoot, r2, &w2, NULL);
@@ -1469,6 +1590,7 @@ static void open_page(const char *key, bool push) {
     build_page();
     if (srcs[CT.src].kind == SK_STORY) mark_visited(srcs[CT.src].sect, page.id);
     if (page.nnext > 1) toast("%d choices: Left/Right to pick, A to go", page.nnext);
+    if (page.locked && !is_unlocked(page.id)) toast("Locked page: press A to type the password");
     autoRequest = cfg.autoFlash && has_kind(1) && !g_noAuto;
     g_noAuto = false;
     snprintf(CT.key, sizeof CT.key, "%s", page.id);
@@ -1476,8 +1598,16 @@ static void open_page(const char *key, bool push) {
     save_tabs();
 }
 
+static void password_open(void) {
+    overlay = 3;
+    pwLen = 0;
+    pwBuf[0] = 0;
+    kbR = kbC = 0;
+}
+
 static void go_next(void) {
     if (!havePage || page.nnext == 0) return;
+    if (page.locked && !is_unlocked(page.id)) { password_open(); return; }
     char k[24];
     snprintf(k, sizeof k, "%s", page.next[selChoice]);
     open_page(k, true);
@@ -1586,6 +1716,12 @@ static void open_link(int i, bool newTab) {
         navigate(s, "0", newTab);
         break;
     }
+    case LK_WV: {
+        int s = src_find("S:Wayward Vagabond");
+        if (s < 0 || !find_page(2, target)) { toast("Wayward Vagabond page isn't in the story data"); return; }
+        navigate(s, target, newTab);
+        break;
+    }
     case LK_ASSET: {
         char res[640];
         if (!resolve_path(target, res, sizeof res)) {
@@ -1622,6 +1758,7 @@ static void run_blocking(int kind, const char *path) {   /* fullscreen flash or 
     heldPad = heldL = heldR = heldPrev = 0;
     selectHeld = false;
     video_init();
+    redrawFrames = 8;
     g_noAuto = true;
     open_page(key, false);
     scrollY = sc > max_scroll() ? max_scroll() : sc;
@@ -1671,6 +1808,7 @@ static void goto_number(int n) {
     int si = CT.src;
     if (srcs[si].kind == SK_STORY) {
         char id[24];
+        if (cfg.pageNums && srcs[si].sect < 2) n = atoi(srcs[si].start) + (n > 0 ? n - 1 : 0);
         for (int d = 0; d <= 300; d++) {
             for (int sgn = 1; sgn >= -1; sgn -= 2) {
                 int c = n + sgn * d;
@@ -1700,7 +1838,7 @@ static void goto_dialog_open(void) {
     if (nTabs == 0) { lib_open(4, true); if (nTabs == 0) return; }
     menuMode = false;
     int v = 0;
-    if (srcs[CT.src].kind == SK_STORY) { gotoWidth = 6; vis_num(page.id, &v); }
+    if (srcs[CT.src].kind == SK_STORY) { gotoWidth = cfg.pageNums ? 4 : 6; if (cfg.pageNums) v = page_num(CT.src, page.id); else vis_num(page.id, &v); }
     else { gotoWidth = 4; int cnt = src_count(CT.src); gotoWidth = cnt > 999 ? 4 : cnt > 99 ? 3 : 2; v = atoi(page.id) + 1; }
     for (int i = gotoWidth - 1; i >= 0; i--) { gotoDigits[i] = v % 10; v /= 10; }
     gotoPos = gotoWidth - 1;
@@ -1764,11 +1902,9 @@ static void fit_text(TTF_Font *f, const char *in, int maxw, char *out, size_t n)
 
 static void tab_label(int i, char *out, size_t n) {
     const Source *s = &srcs[tabs[i].src];
-    if (s->kind == SK_STORY) {
-        const char *k = tabs[i].key;
-        while (*k == '0' && k[1]) k++;
-        snprintf(out, n, "%s %s", s->tag, k);
-    } else if (s->kind == SK_SINGLE) snprintf(out, n, "%s", s->name);
+    char lab[40];
+    if (s->kind == SK_STORY) { page_label(tabs[i].src, tabs[i].key, lab, sizeof lab); snprintf(out, n, "%s %s", s->tag, lab); }
+    else if (s->kind == SK_SINGLE) snprintf(out, n, "%s", s->name);
     else snprintf(out, n, "%s %d", s->name, atoi(tabs[i].key) + 1);
 }
 
@@ -1815,8 +1951,8 @@ static void build_menu(void) {
     nMenu = 0;
     add_mi(MI_SRC, 4);                       /* Homestuck, big */
     add_mi(MI_HEAD, 0);
-    static const int adv[] = {3, 2, 1, 0, 5};
-    for (int i = 0; i < 5; i++) add_mi(MI_SRC, adv[i]);
+    static const int adv[] = {3, 2, 1, 0, 5, 6};
+    for (int i = 0; i < 6; i++) add_mi(MI_SRC, adv[i]);
     add_mi(MI_HEAD, 1);
     for (int c = 1; c < nCats; c++) {
         if (cats[c].n == 1) add_mi(MI_SRC, cats[c].first); else add_mi(MI_CAT, c);
@@ -1862,7 +1998,7 @@ static void mi_texts(const MItem *m, char *name, size_t nn, char *sub, size_t ns
         snprintf(name, nn, "%s", s->name);
         if (s->kind == SK_STORY) {
             if (m->a == 4) snprintf(name, nn, "%s", bm ? "Continue Homestuck" : "Begin Homestuck");
-            if (bm) snprintf(sub, ns, m->a == 4 ? "Resume at page %s" : "resume: page %s", bm);
+            if (bm) { char lab[24]; page_label(m->a, bm, lab, sizeof lab); snprintf(sub, ns, m->a == 4 ? "Resume at page %s" : "resume: page %s", lab); }
             else snprintf(sub, ns, m->a == 4 ? "Start from the beginning (April 2009)" : "not started");
         } else if (bm) snprintf(sub, ns, "resume: page %d", atoi(bm) + 1);
         else snprintf(sub, ns, "not started");
@@ -1959,7 +2095,7 @@ static const char *img_label(char *buf, size_t n) {
     return buf;
 }
 
-enum { S_IMG, S_TEXT, S_SCROLL, S_AUTO, S_LOGS, S_LIGHT, S_GIF, S_SMOOTH, S_LINK, S_START, S_SWAP, S_CLEAR, S_BACK, S_COUNT };
+enum { S_IMG, S_TEXT, S_SCROLL, S_AUTO, S_LOGS, S_LIGHT, S_PAGENUM, S_GIF, S_SMOOTH, S_LINK, S_START, S_SWAP, S_CLEAR, S_BACK, S_COUNT };
 
 static void draw_settings(void) {
     fill(C_BG, 0, 0, SCR_W, SCR_H);
@@ -1975,6 +2111,7 @@ static void draw_settings(void) {
     snprintf(v[S_AUTO], 40, "< %s >", cfg.autoFlash ? "On" : "Off");
     snprintf(v[S_LOGS], 40, "< %s >", cfg.collapseLogs ? "Collapsed" : "Shown");
     snprintf(v[S_LIGHT], 40, "< %s >", cfg.lightText == 0 ? "Blue highlight" : cfg.lightText == 1 ? "Dark box" : cfg.lightText == 2 ? "Light gray" : "Darkened");
+    snprintf(v[S_PAGENUM], 40, "< %s >", cfg.pageNums ? "Story pages" : "MSPA ids");
     snprintf(v[S_GIF], 40, "< %s >", cfg.animGifs ? "On" : "Off");
     snprintf(v[S_SMOOTH], 40, "< %s >", cfg.smooth ? "Smooth" : "Sharp pixels");
     snprintf(v[S_LINK], 40, "< %s >", cfg.linkNewTab ? "New tab" : "This tab");
@@ -1982,12 +2119,13 @@ static void draw_settings(void) {
     snprintf(v[S_SWAP], 40, "< %s >", cfg.swapAB ? "On" : "Off");
     snprintf(v[S_CLEAR], 40, "A: clear");
     v[S_BACK][0] = 0;
-    static const char *nm[S_COUNT] = {"Image size", "Text size", "Scroll speed", "Auto-play Flash pages", "Pesterlogs & other logs", "Light-coloured text", "Animate GIFs",
+    static const char *nm[S_COUNT] = {"Image size", "Text size", "Scroll speed", "Auto-play Flash pages", "Pesterlogs & other logs", "Light-coloured text", "Page numbers", "Animate GIFs",
                                       "Image scaling", "Links open in", "On start", "Swap A/B buttons", "Clear read history", "Back"};
     static const char *ds[S_COUNT] = {"How big page art is drawn. Smaller = more text visible without scrolling.",
         "Page text size.", "How fast Up/Down scrolls a page.", "Start a page's Flash automatically when you arrive on it.",
         "Start logs hidden behind a Show button, like the website.",
-        "White text (Doctor Scratch etc.): blue highlight, dark box, light gray, or darkened.", "Off = still pictures (smoother on slow devices).",
+        "White text (Doctor Scratch etc.): blue highlight, dark box, light gray, or darkened.",
+        "Story pages = 1..8130 for Homestuck like the Collection; MSPA ids = 001901..010030.", "Off = still pictures (smoother on slow devices).",
         "Sharp pixels keeps pixel art crisp; Smooth blurs it slightly when resized.", "Where links from the link list (Start) open when you press A.",
         "Resume the tabs you had open, or always start at the main menu.", "For controllers whose A/B are labelled the other way round.",
         "Forget which pages you've read (purple links).", ""};
@@ -2022,6 +2160,7 @@ static void settings_adjust(int dir) {
     case S_AUTO: cfg.autoFlash = !cfg.autoFlash; break;
     case S_LOGS: cfg.collapseLogs = !cfg.collapseLogs; break;
     case S_LIGHT: cfg.lightText = (cfg.lightText + dir + 4) % 4; break;
+    case S_PAGENUM: cfg.pageNums = !cfg.pageNums; break;
     case S_GIF: cfg.animGifs = !cfg.animGifs; break;
     case S_SMOOTH: cfg.smooth = !cfg.smooth; break;
     case S_LINK: cfg.linkNewTab = !cfg.linkNewTab; break;
@@ -2033,7 +2172,7 @@ static void settings_adjust(int dir) {
     settings_save();
     if (setSel == S_TEXT) apply_text_size();
     else if (setSel == S_LOGS) { logOpen = !cfg.collapseLogs; rebuild_layout(); }
-    else if (setSel == S_IMG || setSel == S_LIGHT) rebuild_layout();
+    else if (setSel == S_IMG || setSel == S_LIGHT || setSel == S_PAGENUM) rebuild_layout();
     else if (setSel == S_SMOOTH && havePage) {           /* textures are made with the scaling mode: reload the page */
         char k[24];
         snprintf(k, sizeof k, "%s", page.id);
@@ -2077,7 +2216,8 @@ static void draw_controls(void) {
         {"A / Y", "Open here / in a new tab"},
         {"Start / R3", "Close the current tab"},
         {"D-pad, sticks", "Move; Left/Right change a setting"},
-        {"FLASH", ""},
+        {"FLASH / VIDEO", ""},
+        {"Select+X", "Flash: mouse mode (D-pad moves, Y clicks)"},
         {"Select+Start", "Quit the flash (back to the page)"},
         {"Select+Start", "Quit the reader (from the page)"},
     };
@@ -2177,6 +2317,7 @@ static void draw_page(void) {
 static const char *link_tag(const Link *l) {
     if (l->kind == LK_PAGE) return "PAGE";
     if (l->kind == LK_TSO) return "COMIC";
+    if (l->kind == LK_WV) return "STORY";
     if (l->kind == LK_WEB) return "WEB";
     const char *x = ext_of(l->target);
     if (!strcasecmp(x, "swf")) return "FLASH";
@@ -2415,6 +2556,74 @@ static void find_assets(const char *arg) {
     while (al > 1 && assets[al - 1] == '/') assets[--al] = 0;
 }
 
+static const char *KB[4] = {"ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ0123", "456789-'._"};
+
+static void password_confirm(void) {
+    char want[64];
+    bool have = pw_expected(page.id, want, sizeof want);
+    if (have && strcasecmp(want, pwBuf) != 0) { toast("Wrong password"); return; }
+    if (!have && pwLen == 0) return;
+    unlock_page(page.id);
+    overlay = 0;
+    if (!have) toast("Unlocked (no password on file for %s: add %s=password to passwords.txt to check)", page.id, page.id);
+    else toast("Unlocked");
+    go_next();
+}
+
+static void handle_password(int b) {
+    switch (b) {
+    case SDL_CONTROLLER_BUTTON_DPAD_UP: if (kbR > 0) kbR--; break;
+    case SDL_CONTROLLER_BUTTON_DPAD_DOWN: if (kbR < 4) kbR++; break;
+    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: if (kbC > 0) kbC--; break;
+    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: kbC++; break;
+    case SDL_CONTROLLER_BUTTON_A:
+        if (kbR < 4) { if (pwLen < 30) { pwBuf[pwLen++] = KB[kbR][kbC]; pwBuf[pwLen] = 0; } }
+        else if (kbC == 0) { if (pwLen < 30) { pwBuf[pwLen++] = ' '; pwBuf[pwLen] = 0; } }
+        else if (kbC == 1) { if (pwLen > 0) pwBuf[--pwLen] = 0; }
+        else if (kbC == 2) password_confirm();
+        else overlay = 0;
+        break;
+    case SDL_CONTROLLER_BUTTON_B: if (pwLen > 0) pwBuf[--pwLen] = 0; break;
+    case SDL_CONTROLLER_BUTTON_Y:
+    case SDL_CONTROLLER_BUTTON_START: password_confirm(); break;
+    case SDL_CONTROLLER_BUTTON_X: overlay = 0; break;
+    default: break;
+    }
+    int maxc = kbR < 4 ? 9 : 3;
+    if (kbC > maxc) kbC = maxc;
+}
+
+static void draw_password(void) {
+    fill_a((SDL_Color){0, 0, 0, 255}, 170, 0, TB, SCR_W, VIEW_H);
+    int pw = 480, ph = 330, px = (SCR_W - pw) / 2, py = TB + (VIEW_H - ph) / 2;
+    fill(C_COL, px, py, pw, ph);
+    draw_center(fBody, "Locked page - type the password", py + 10, C_BLACK);
+    fill(C_WHITE, px + 30, py + 40, pw - 60, 34);
+    char shown[40];
+    snprintf(shown, sizeof shown, "%s_", pwBuf);
+    draw_str(fMenu, shown, px + 38, py + 44, C_BLACK);
+    int cw = 40, ch = 38, gx = px + (pw - 10 * cw) / 2, gy = py + 90;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 10; c++) {
+            bool sel = r == kbR && c == kbC;
+            fill(sel ? C_HILITE : C_WHITE, gx + c * cw + 2, gy + r * ch + 2, cw - 4, ch - 4);
+            char k[2] = {KB[r][c], 0};
+            int w = 0;
+            TTF_SizeUTF8(fMenu, k, &w, NULL);
+            draw_str(fMenu, k, gx + c * cw + (cw - w) / 2, gy + r * ch + 6, C_BLACK);
+        }
+    static const char *act[4] = {"SPACE", "DEL", "OK", "CANCEL"};
+    int bw = 100, bx0 = px + (pw - 4 * bw) / 2;
+    for (int c = 0; c < 4; c++) {
+        bool sel = kbR == 4 && c == kbC;
+        fill(sel ? C_HILITE : C_WHITE, bx0 + c * bw + 2, gy + 4 * ch + 2, bw - 4, ch - 4);
+        int w = 0;
+        TTF_SizeUTF8(fFoot, act[c], &w, NULL);
+        draw_str(fFoot, act[c], bx0 + c * bw + (bw - w) / 2, gy + 4 * ch + 12, C_BLACK);
+    }
+    draw_center(fFoot, "A: type  |  B: delete  |  Y or Start: enter  |  X: cancel", py + ph - 26, C_GREY);
+}
+
 static void dispatch_button(int b) {
     if (menuMode) {
         switch (libLevel) {
@@ -2426,6 +2635,7 @@ static void dispatch_button(int b) {
     }
     else if (overlay == 1) handle_links(b);
     else if (overlay == 2) handle_goto(b);
+    else if (overlay == 3) handle_password(b);
     else handle_reading(b);
 }
 
@@ -2445,6 +2655,7 @@ int main(int argc, char **argv) {
     find_assets(argc > 1 ? argv[1] : NULL);
     settings_load();
     visited_load();
+    unlocked_load();
 
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");   /* lets the page take focus back from a flash */
     if (SDL_Init(0) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
@@ -2555,9 +2766,10 @@ int main(int argc, char **argv) {
             }
         }
         if (toastUntil && now < toastUntil + 50) dirty = true;
+        if (redrawFrames > 0) { redrawFrames--; dirty = true; }
         if (dirty) {
             if (menuMode) draw_library();
-            else { draw_page(); if (overlay == 1) draw_links(); else if (overlay == 2) draw_goto(); }
+            else { draw_page(); if (overlay == 1) draw_links(); else if (overlay == 2) draw_goto(); else if (overlay == 3) draw_password(); }
             draw_tabbar();
             draw_toast();
             SDL_RenderPresent(ren);
