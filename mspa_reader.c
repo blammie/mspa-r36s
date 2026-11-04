@@ -153,6 +153,8 @@ typedef struct {
     int scroll;
     char hist[HIST_MAX][24];
     int nHist;
+    int retSrc;          /* where a Wayward Vagabond page was linked from */
+    char retKey[24];
 } Tab;
 
 typedef struct { char sid[110]; char key[24]; } Bm;
@@ -588,10 +590,6 @@ static bool load_data(void) {
 }
 
 /* ------------------------------------------------------------ page load */
-static const char *WV_ORDER[] = {"anunsealedtunnel", "windsdownsideways", "beneaththegleam", "recordsastutteringstep",
-                                 "asentrywakens", "anagitatedfinger", "astudiouseye", "preparesforcompany"};
-#define NWV ((int)(sizeof WV_ORDER / sizeof WV_ORDER[0]))
-
 static bool story_load(int s, const char *id, Page *p) {
     memset(p, 0, sizeof *p);
     const JNode *n = find_page(s, id);
@@ -612,13 +610,7 @@ static bool story_load(int s, const char *id, Page *p) {
     }
     char *pv = jdup(jget(n, "previous"));
     if (pv) { snprintf(p->prev, sizeof p->prev, "%s", pv); free(pv); }
-    if (s == 2) {                                  /* Wayward Vagabond: no links in the data, use the story order */
-        for (int i = 0; i < NWV; i++) {
-            if (strcmp(WV_ORDER[i], id) != 0) continue;
-            if (i + 1 < NWV) { snprintf(p->next[0], 24, "%s", WV_ORDER[i + 1]); p->nnext = 1; }
-            if (i > 0) snprintf(p->prev, sizeof p->prev, "%s", WV_ORDER[i - 1]);
-        }
-    }
+    if (s == 2) { p->nnext = 1; snprintf(p->next[0], 24, "return"); p->prev[0] = 0; }   /* WV is not a story: A/B return to the linking page */
     const JNode *fl = jget(n, "flag");
     for (const JNode *c = fl ? fl->child : NULL; c; c = c->next)
         if (c->t == J_STR && c->len == 10 && !memcmp(c->s, "TZPASSWORD", 10)) p->locked = true;
@@ -1218,14 +1210,56 @@ static void media_free(void) {
     nMedia = 0;
 }
 
-static SDL_Texture *tex_from_rgba(const uint8_t *px, int w, int h) {
-    if (w > MAX_TEX || h > MAX_TEX) return NULL;
+static SDL_Texture *tex_from_rgba(const uint8_t *px, int w, int h, bool *scaled) {
+    if (scaled) *scaled = false;
+    if (w > MAX_TEX || h > MAX_TEX) {              /* too big for one texture: average it down to fit */
+        float k = (float)MAX_TEX / (float)(w > h ? w : h);
+        int nw = (int)((float)w * k), nh = (int)((float)h * k);
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        uint8_t *small = malloc((size_t)nw * (size_t)nh * 4);
+        if (!small) return NULL;
+        for (int y = 0; y < nh; y++) {
+            int y0 = (int)((long)y * h / nh), y1 = (int)((long)(y + 1) * h / nh);
+            if (y1 <= y0) y1 = y0 + 1;
+            for (int x = 0; x < nw; x++) {
+                int x0 = (int)((long)x * w / nw), x1 = (int)((long)(x + 1) * w / nw);
+                if (x1 <= x0) x1 = x0 + 1;
+                unsigned r = 0, g = 0, b = 0, a = 0, n = 0;
+                for (int yy = y0; yy < y1 && yy < h; yy++)
+                    for (int xx = x0; xx < x1 && xx < w; xx++) {
+                        const uint8_t *q = px + ((size_t)yy * (size_t)w + (size_t)xx) * 4;
+                        r += q[0]; g += q[1]; b += q[2]; a += q[3]; n++;
+                    }
+                uint8_t *o = small + ((size_t)y * (size_t)nw + (size_t)x) * 4;
+                if (n) { o[0] = (uint8_t)(r / n); o[1] = (uint8_t)(g / n); o[2] = (uint8_t)(b / n); o[3] = (uint8_t)(a / n); }
+            }
+        }
+        SDL_Texture *t = tex_from_rgba(small, nw, nh, NULL);
+        free(small);
+        if (scaled) *scaled = true;
+        return t;
+    }
     SDL_Texture *t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
     if (!t) return NULL;
     SDL_UpdateTexture(t, NULL, px, w * 4);
     SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
     SDL_SetTextureScaleMode(t, cfg.smooth ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
     return t;
+}
+
+/* GIFs that are huge or known to lag are shown as still pictures (extra page ids can go in static.txt) */
+static bool force_static_gif(int w, int h) {
+    if ((long)w * h > 1000000L || !strcmp(page.id, "001942")) return true;
+    char *f = (char *)read_file("static.txt", NULL);
+    if (!f) return false;
+    bool hit = false;
+    for (char *line = strtok(f, "\n"); line && !hit; line = strtok(NULL, "\n")) {
+        line[strcspn(line, "\r")] = 0;
+        hit = !strcmp(line, page.id);
+    }
+    free(f);
+    return hit;
 }
 
 static bool is_video_ext(const char *x) {
@@ -1274,15 +1308,16 @@ static void media_load(Media *m) {
             Gif *g = gif_open_mem(buf, n);
             if (g && gif_next(g)) {
                 m->w = g->w; m->h = g->h;
-                m->tex = tex_from_rgba(g->canvas, g->w, g->h);
-                if (m->tex && g->animated) { m->gif = g; m->nextTick = SDL_GetTicks() + (uint32_t)g->delay_ms; }
+                bool scaled = false;
+                m->tex = tex_from_rgba(g->canvas, g->w, g->h, &scaled);
+                if (m->tex && g->animated && !scaled && !force_static_gif(g->w, g->h)) { m->gif = g; m->nextTick = SDL_GetTicks() + (uint32_t)g->delay_ms; }
                 else gif_close(g);
             } else gif_close(g);
         } else {
             int w, h, c;
             uint8_t *px = stbi_load_from_memory(buf, (int)n, &w, &h, &c, 4);
             free(buf);
-            if (px) { m->w = w; m->h = h; m->tex = tex_from_rgba(px, w, h); stbi_image_free(px); }
+            if (px) { m->w = w; m->h = h; m->tex = tex_from_rgba(px, w, h, NULL); stbi_image_free(px); }
         }
         if (!m->tex) { m->kind = 2; snprintf(m->label, sizeof m->label, "[ Image too large or unreadable ]<br />%.200s", m->rel); }
         return;
@@ -1431,9 +1466,10 @@ static void build_page(void) {
             m->dh = (int)((float)sh * sc + 0.5f);
             int avail = SCR_H - TB - y - 26;  /* the whole card must be on screen at scroll 0 */
             if (avail > 60 && m->dh > avail) { m->dw = m->dw * avail / m->dh; m->dh = avail; }
-            int cy = y + m->dh / 2 - 24;
+            int cy = y + m->dh / 2 - 34;
             card_line(fBody, "[ Flash ]", m, &cy);
             card_line(fFoot, "Y: play (fullscreen)", m, &cy);
+            card_line(fFoot, "Select+Start: exit the flash", m, &cy);
             char hint[200];
             read_hint(m->path, hint, sizeof hint);
             if (hint[0]) card_line(fFoot, hint, m, &cy);
@@ -1441,7 +1477,7 @@ static void build_page(void) {
         } else {                              /* video / message card */
             int cy = y + 12;
             char txt[900];
-            if (m->kind == 3) snprintf(txt, sizeof txt, "[ Video ]<br />Press Y to play");
+            if (m->kind == 3) snprintf(txt, sizeof txt, "[ Video ]<br />Press Y to play<br />Exit key may vary depending on your OS");
             else snprintf(txt, sizeof txt, "%s", m->label);
             layout_html(fBody, txt, C_CARDTXT, bx + 10, bw - 20, true, &cy);
             m->dw = COL_W;
@@ -1462,7 +1498,8 @@ static void build_page(void) {
     int nChoice = page.nnext;
     for (int i = 0; i < nChoice; i++) {
         choiceText[i][0] = 0;
-        if (srcs[CT.src].kind == SK_STORY) {
+        if (srcs[CT.src].kind == SK_STORY && srcs[CT.src].sect == 2) snprintf(choiceText[i], sizeof choiceText[i], "Return to the story ==>");
+        else if (srcs[CT.src].kind == SK_STORY) {
             Page tmp;
             if (story_load(srcs[CT.src].sect, page.next[i], &tmp)) {
                 snprintf(choiceText[i], sizeof choiceText[i], "%s", tmp.title);
@@ -1598,6 +1635,21 @@ static void open_page(const char *key, bool push) {
     save_tabs();
 }
 
+static void goto_here(int src, const char *keyIn);
+
+static void wv_return(void) {                    /* leave a Wayward Vagabond page: back to the page that linked to it */
+    int rs = CT.retSrc;
+    char rk[24];
+    snprintf(rk, sizeof rk, "%s", CT.retKey);
+    if (!rk[0] || srcs[rs].sect == 2) {          /* unknown origin (restored tab): the Homestuck bookmark */
+        const char *bm = bm_get("S:Homestuck");
+        rs = src_find("S:Homestuck");
+        snprintf(rk, sizeof rk, "%s", bm ? bm : "001901");
+    }
+    CT.retKey[0] = 0;
+    goto_here(rs, rk);
+}
+
 static void password_open(void) {
     overlay = 3;
     pwLen = 0;
@@ -1607,6 +1659,7 @@ static void password_open(void) {
 
 static void go_next(void) {
     if (!havePage || page.nnext == 0) return;
+    if (srcs[CT.src].kind == SK_STORY && srcs[CT.src].sect == 2) { wv_return(); return; }
     if (page.locked && !is_unlocked(page.id)) { password_open(); return; }
     char k[24];
     snprintf(k, sizeof k, "%s", page.next[selChoice]);
@@ -1615,6 +1668,7 @@ static void go_next(void) {
 
 static void go_prev(void) {
     if (!havePage) return;
+    if (srcs[CT.src].kind == SK_STORY && srcs[CT.src].sect == 2) { wv_return(); return; }
     char k[24];
     g_noAuto = true;
     if (CT.nHist > 0) { snprintf(k, sizeof k, "%s", CT.hist[--CT.nHist]); open_page(k, false); return; }
@@ -1719,7 +1773,11 @@ static void open_link(int i, bool newTab) {
     case LK_WV: {
         int s = src_find("S:Wayward Vagabond");
         if (s < 0 || !find_page(2, target)) { toast("Wayward Vagabond page isn't in the story data"); return; }
+        int os = CT.src;
+        char ok[24];
+        snprintf(ok, sizeof ok, "%s", page.id);
         navigate(s, target, newTab);
+        if (nTabs > 0 && CT.src == s) { CT.retSrc = os; snprintf(CT.retKey, sizeof CT.retKey, "%s", ok); }
         break;
     }
     case LK_ASSET: {
@@ -1762,7 +1820,7 @@ static void run_blocking(int kind, const char *path) {   /* fullscreen flash or 
     g_noAuto = true;
     open_page(key, false);
     scrollY = sc > max_scroll() ? max_scroll() : sc;
-    if (kind == 3 && WIFEXITED(rc) && WEXITSTATUS(rc) == 2) toast("No video player found on this system");
+    if (kind == 3 && WIFEXITED(rc) && WEXITSTATUS(rc) == 2) toast("No working video player - see log.txt");
 }
 
 static void play_external(int kind) {
@@ -1951,8 +2009,8 @@ static void build_menu(void) {
     nMenu = 0;
     add_mi(MI_SRC, 4);                       /* Homestuck, big */
     add_mi(MI_HEAD, 0);
-    static const int adv[] = {3, 2, 1, 0, 5, 6};
-    for (int i = 0; i < 6; i++) add_mi(MI_SRC, adv[i]);
+    static const int adv[] = {3, 2, 1, 0, 5};
+    for (int i = 0; i < 5; i++) add_mi(MI_SRC, adv[i]);
     add_mi(MI_HEAD, 1);
     for (int c = 1; c < nCats; c++) {
         if (cats[c].n == 1) add_mi(MI_SRC, cats[c].first); else add_mi(MI_CAT, c);
