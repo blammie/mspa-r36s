@@ -28,6 +28,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <glob.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <signal.h>
 #include <zlib.h>
 
@@ -81,6 +83,20 @@ static const SDL_Color C_WHITE = {250, 250, 250, 255};
 static const SDL_Color C_SELECT = {40, 110, 220, 255};   /* "selected text" blue behind light text */
 static const SDL_Color C_DARKBOX = {20, 20, 20, 255};
 
+typedef struct { SDL_Color bg, panel, col, title, text, arrow, link, visited; bool dark; } Theme;
+static const Theme TH_DEFAULT = {{83, 83, 83, 255}, {198, 198, 198, 255}, {238, 238, 238, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 238, 255}, {85, 26, 139, 255}, false};
+static const Theme TH_SCRATCH = {{0, 0, 0, 255}, {7, 42, 0, 255}, {14, 71, 3, 255}, {255, 255, 255, 255}, {0, 0, 0, 255}, {255, 255, 255, 255}, {20, 255, 36, 255}, {95, 200, 105, 255}, true};
+static const Theme TH_CASCADE = {{0, 0, 0, 255}, {38, 38, 38, 255}, {38, 38, 38, 255}, {0, 116, 255, 255}, {225, 225, 225, 255}, {255, 255, 255, 255}, {0, 116, 255, 255}, {0, 80, 190, 255}, true};
+static const Theme TH_SBAHJ = {{244, 0, 236, 255}, {20, 255, 36, 255}, {255, 255, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 0, 255}, {0, 0, 238, 255}, {85, 26, 139, 255}, false};
+static const Theme *th = &TH_DEFAULT;
+
+static const Theme *theme_for(const char *name) {      /* page "theme" field in mspa.json; others use the default look */
+    if (!strcmp(name, "scratch")) return &TH_SCRATCH;
+    if (!strcmp(name, "cascade")) return &TH_CASCADE;
+    if (!strcmp(name, "sbahj")) return &TH_SBAHJ;
+    return &TH_DEFAULT;
+}
+
 /* ---------------------------------------------------------------- types */
 typedef struct { const char *k; uint32_t l; const JNode *n; } Key;
 typedef struct { Key *keys; int n; } Section;
@@ -115,6 +131,7 @@ typedef struct {
     char prev[24];
     bool valid;
     bool locked;      /* TZPASSWORD page: needs its password before moving on */
+    char theme[16];
 } Page;
 
 typedef struct {
@@ -207,8 +224,8 @@ static char toastMsg[200];
 static uint32_t toastUntil;
 typedef struct { int imgPct; int textSize; bool autoFlash; bool collapseLogs; bool swapAB;
                  int scrollSpeed; bool animGifs; bool smooth; bool linkNewTab; bool startMenu;
-                 int lightText; bool pageNums; } Settings;   /* lightText: 0 blue highlight, 1 dark box, 2 gray, 3 darkened */
-static Settings cfg = {55, 1, false, true, false, 1, true, true, true, false, 0, false};   /* imgPct: 30..150, 999 = fit column width */
+                 int lightText; bool pageNums; bool showRQ; } Settings;   /* lightText: 0 blue highlight, 1 dark box, 2 gray, 3 darkened */
+static Settings cfg = {55, 1, false, true, false, 1, true, true, true, false, 0, false, false};   /* imgPct: 30..150, 999 = fit column width */
 static uint8_t *visitedBits[2];
 static bool logOpen, logPresent, autoRequest, g_noAuto, g_logs;
 static bool selectHeld;
@@ -608,6 +625,8 @@ static bool story_load(int s, const char *id, Page *p) {
         char *s2 = jdup(c);
         if (s2) { int ni = p->nnext++; snprintf(p->next[ni], 24, "%s", s2); free(s2); }
     }
+    char *tn = jdup(jget(n, "theme"));
+    if (tn) { snprintf(p->theme, sizeof p->theme, "%s", tn); free(tn); }
     char *pv = jdup(jget(n, "previous"));
     if (pv) { snprintf(p->prev, sizeof p->prev, "%s", pv); free(pv); }
     if (s == 2) { p->nnext = 1; snprintf(p->next[0], 24, "return"); p->prev[0] = 0; }   /* WV is not a story: A/B return to the linking page */
@@ -686,8 +705,8 @@ static void page_free(Page *p) { free(p->html); p->html = NULL; p->valid = false
 static void settings_save(void) {
     FILE *f = fopen("conf/settings.txt", "w");
     if (!f) return;
-    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nscrollspeed=%d\nanimgifs=%d\nsmooth=%d\nlinknewtab=%d\nstartmenu=%d\nlighttext=%d\npagenums=%d\n",
-            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.scrollSpeed, cfg.animGifs, cfg.smooth, cfg.linkNewTab, cfg.startMenu, cfg.lightText, cfg.pageNums);
+    fprintf(f, "imgpct=%d\ntextsize=%d\nautoflash=%d\ncollapselogs=%d\nswapab=%d\nscrollspeed=%d\nanimgifs=%d\nsmooth=%d\nlinknewtab=%d\nstartmenu=%d\nlighttext=%d\npagenums=%d\nshowrq=%d\n",
+            cfg.imgPct, cfg.textSize, cfg.autoFlash, cfg.collapseLogs, cfg.swapAB, cfg.scrollSpeed, cfg.animGifs, cfg.smooth, cfg.linkNewTab, cfg.startMenu, cfg.lightText, cfg.pageNums, cfg.showRQ);
     fflush(f);
     fsync(fileno(f));
     fclose(f);
@@ -710,6 +729,7 @@ static void settings_load(void) {
         else if (sscanf(line, "startmenu=%d", &v) == 1) cfg.startMenu = v != 0;
         else if (sscanf(line, "lighttext=%d", &v) == 1) cfg.lightText = v < 0 ? 0 : v > 3 ? 3 : v;
         else if (sscanf(line, "pagenums=%d", &v) == 1) cfg.pageNums = v != 0;
+        else if (sscanf(line, "showrq=%d", &v) == 1) cfg.showRQ = v != 0;
     }
     free(s);
 }
@@ -895,7 +915,7 @@ static void item_add(TTF_Font *f, const char *text, SDL_Color c, int x, int y) {
     it->x = x;
     it->y = y;
     TTF_SizeUTF8(f, text, &it->w, &it->h);
-    if (g_logs && cfg.lightText <= 1 && is_light(c)) {   /* page text only (g_logs is set while it is laid out) */
+    if (g_logs && cfg.lightText <= 1 && !th->dark && is_light(c)) {   /* page text only (g_logs is set while it is laid out) */
         it->bg = (uint8_t)(cfg.lightText + 1);
         it->bgH = TTF_FontLineSkip(f);
     }
@@ -1106,14 +1126,14 @@ static void layout_html(TTF_Font *f, const char *html, SDL_Color base, int boxX,
                 }
                 if (sp < 23) stack[++sp] = fix_color(c); else stack[sp] = fix_color(c);
             } else if (!strcmp(name, "a") && !closing) {
-                SDL_Color lc = C_LINK;
+                SDL_Color lc = th->link;
                 if (g_links && nLinks < MAX_LINKS) {
                     Link *lk = &links[nLinks];
                     memset(lk, 0, sizeof *lk);
                     if (tag_attr(p, e, "href", lk->url, sizeof lk->url)) {
                         decode_entities(lk->url);
                         classify_link(lk);
-                        if (lk->kind == LK_PAGE && is_visited(0, lk->target)) lc = C_VISITED;
+                        if (lk->kind == LK_PAGE && is_visited(0, lk->target)) lc = th->visited;
                         curLinkIdx = nLinks++;
                     }
                 }
@@ -1445,7 +1465,7 @@ static void build_page(void) {
     int mainMedia = nMedia;
 
     g_links = g_inl = g_logs = false;
-    layout_html(fTitle, page.title[0] ? page.title : "...", C_BLACK, bx, bw, true, &y);
+    layout_html(fTitle, page.title[0] ? page.title : "...", th->title, bx, bw, true, &y);
     y += 10;
 
     for (int i = 0; i < mainMedia; i++) {
@@ -1489,7 +1509,7 @@ static void build_page(void) {
     y += 14;
     if (page.html && page.html[0]) {
         g_links = g_inl = g_logs = true;
-        layout_html(fBody, page.html, C_BLACK, bx, bw, true, &y);
+        layout_html(fBody, page.html, th->text, bx, bw, true, &y);
         g_links = g_inl = g_logs = false;
         y += 6;
     }
@@ -1513,10 +1533,10 @@ static void build_page(void) {
         bool arrow = strstr(choiceText[i], "=>") != NULL;
         choiceTop[i] = y;
         int pw = 0;
-        if (!arrow) { TTF_SizeUTF8(fCmd, "> ", &pw, NULL); item_add(fCmd, ">", C_BLACK, bx, y); }
+        if (!arrow) { TTF_SizeUTF8(fCmd, "> ", &pw, NULL); item_add(fCmd, ">", th->arrow, bx, y); }
         int cy = y;
         bool seen = srcs[CT.src].kind == SK_STORY && is_visited(srcs[CT.src].sect, page.next[i]);
-        layout_html(fLink, choiceText[i][0] ? choiceText[i] : "...", seen ? C_VISITED : C_LINK, bx + pw, bw - pw, false, &cy);
+        layout_html(fLink, choiceText[i][0] ? choiceText[i] : "...", seen ? th->visited : th->link, bx + pw, bw - pw, false, &cy);
         y = cy + 10;
         choiceBot[i] = y - 6;
     }
@@ -1540,9 +1560,9 @@ static void build_page(void) {
         TTF_SizeUTF8(fFootU, fl[i], &w, NULL);
         TTF_SizeUTF8(fFoot, " | ", &sw, NULL);
         if (fx + w > bx + bw && fx > bx) { fx = bx; y += fs + 2; }
-        item_add(fFootU, fl[i], C_LINK, fx, y);
+        item_add(fFootU, fl[i], th->link, fx, y);
         fx += w;
-        if (i + 1 < nf) { item_add(fFoot, " | ", C_BLACK, fx, y); fx += sw; }
+        if (i + 1 < nf) { item_add(fFoot, " | ", th->arrow, fx, y); fx += sw; }
     }
     y += fs + 6;
     char r2[80] = " | L1/R1: back/next";
@@ -1555,8 +1575,8 @@ static void build_page(void) {
     int w1 = 0, w2 = 0;
     TTF_SizeUTF8(fFootU, r1, &w1, NULL);
     TTF_SizeUTF8(fFoot, r2, &w2, NULL);
-    item_add(fFootU, r1, C_LINK, bx + bw - w1 - w2, y);
-    item_add(fFoot, r2, C_BLACK, bx + bw - w2, y);
+    item_add(fFootU, r1, th->link, bx + bw - w1 - w2, y);
+    item_add(fFoot, r2, th->arrow, bx + bw - w2, y);
     y += fs + 16;
     pageH = y + COL_TOP;
 }
@@ -1615,6 +1635,7 @@ static void open_page(const char *key, bool push) {
     page_free(&page);
     page = np;
     havePage = true;
+    th = srcs[CT.src].kind == SK_STORY ? theme_for(page.theme) : &TH_DEFAULT;
     nMedia = page.nmedia;
     for (int i = 0; i < nMedia; i++) {
         snprintf(media[i].rel, sizeof media[i].rel, "%s", page.media[i]);
@@ -1823,9 +1844,15 @@ static void run_blocking(int kind, const char *path) {   /* fullscreen flash or 
     if (kind == 3 && WIFEXITED(rc) && WEXITSTATUS(rc) == 2) toast("No working video player - see log.txt");
 }
 
+static bool video_inline(const char *path);
+
 static void play_external(int kind) {
     for (int i = 0; i < nMedia; i++)
-        if (media[i].kind == kind) { run_blocking(kind, media[i].path); return; }
+        if (media[i].kind == kind) {
+            if (kind == 3 && video_inline(media[i].path)) return;     /* built-in player; else the external players */
+            run_blocking(kind, media[i].path);
+            return;
+        }
 }
 
 static void restore_tabs(void) {
@@ -1958,6 +1985,193 @@ static void fit_text(TTF_Font *f, const char *in, int maxw, char *out, size_t n)
     }
 }
 
+/* ------------------------------------------------------------- built-in video player */
+/* ffmpeg decodes to raw 640x480 YUV frames and 44.1 kHz stereo audio on two pipes; the reader shows the frames
+   (letterboxed) and queues the audio. Controls: A pause, Left/Right -/+10 s, B or Start stop. */
+#define VW 640
+#define VH 480
+#define VFPS 25
+#define VFRAME (VW * VH * 3 / 2)
+#define ABPS 176400                      /* audio bytes per second */
+
+static bool find_exe(const char *name, char *out, size_t n) {
+    char dirs[1400];
+    const char *path = getenv("PATH");
+    snprintf(dirs, sizeof dirs, "%s:/usr/bin:/usr/local/bin:/opt/ffmpeg/bin", path ? path : "");
+    for (char *d = strtok(dirs, ":"); d; d = strtok(NULL, ":")) {
+        snprintf(out, n, "%s/%s", d, name);
+        if (access(out, X_OK) == 0) return true;
+    }
+    return false;
+}
+
+static pid_t spawn_reader(const char *prog, char *const argv[], int *rfd) {
+    int fd[2];
+    if (pipe(fd) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return -1; }
+    if (pid == 0) {
+        dup2(fd[1], 1);
+        close(fd[0]);
+        close(fd[1]);
+        int nul = open("/dev/null", O_RDONLY);
+        if (nul >= 0) { dup2(nul, 0); if (nul > 2) close(nul); }
+        execv(prog, argv);
+        _exit(127);
+    }
+    close(fd[1]);
+    fcntl(fd[0], F_SETFL, fcntl(fd[0], F_GETFL) | O_NONBLOCK);
+    *rfd = fd[0];
+    return pid;
+}
+
+typedef struct { pid_t vp, ap; int vfd, afd; } VProc;
+
+static void vproc_start(VProc *p, const char *ff, const char *file, double pos) {
+    char ss[32];
+    snprintf(ss, sizeof ss, "%.2f", pos);
+    char *va[] = {(char *)ff, "-nostdin", "-loglevel", "error", "-ss", ss, "-i", (char *)file, "-an", "-vf",
+                  "scale=640:480:force_original_aspect_ratio=decrease,pad=640:480:(ow-iw)/2:(oh-ih)/2,fps=25",
+                  "-pix_fmt", "yuv420p", "-f", "rawvideo", "-", NULL};
+    char *aa[] = {(char *)ff, "-nostdin", "-loglevel", "error", "-ss", ss, "-i", (char *)file, "-vn", "-f", "s16le",
+                  "-ar", "44100", "-ac", "2", "-", NULL};
+    p->vp = spawn_reader(ff, va, &p->vfd);
+    p->ap = spawn_reader(ff, aa, &p->afd);
+}
+
+static void vproc_stop(VProc *p) {
+    if (p->vp > 0) { kill(p->vp, SIGTERM); waitpid(p->vp, NULL, 0); }
+    if (p->ap > 0) { kill(p->ap, SIGTERM); waitpid(p->ap, NULL, 0); }
+    if (p->vfd > 0) close(p->vfd);
+    if (p->afd > 0) close(p->afd);
+    memset(p, 0, sizeof *p);
+}
+
+static void video_show(SDL_Texture *tex, bool paused) {
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    if (tex) SDL_RenderCopy(ren, tex, NULL, NULL);
+    if (paused) draw_center(fBody, "PAUSED", 10, C_CARDTXT);
+    SDL_RenderPresent(ren);
+}
+
+static bool video_inline(const char *path) {
+    char ff[300];
+    if (!find_exe("ffmpeg", ff, sizeof ff)) return false;
+    SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, VW, VH);
+    uint8_t *frame = malloc(VFRAME), abuf[16384];
+    if (!tex || !frame) { if (tex) SDL_DestroyTexture(tex); free(frame); return false; }
+    fprintf(stderr, "Video (built-in player): %s via %s\n", path, ff);
+
+    bool audioInit = SDL_InitSubSystem(SDL_INIT_AUDIO) == 0;
+    SDL_AudioDeviceID dev = 0;
+    if (audioInit) {
+        SDL_AudioSpec want;
+        memset(&want, 0, sizeof want);
+        want.freq = 44100; want.format = AUDIO_S16SYS; want.channels = 2; want.samples = 2048;
+        dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+    }
+    if (!dev) fprintf(stderr, "No audio output available: playing without sound\n");
+
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    draw_center(fBody, "Loading video...", SCR_H / 2 - 10, C_CARDTXT);
+    SDL_RenderPresent(ren);
+
+    VProc vp;
+    memset(&vp, 0, sizeof vp);
+    double pos = 0;
+    vproc_start(&vp, ff, path, pos);
+    size_t fgot = 0;
+    bool vReady = false, vEOF = false, aEOF = false, paused = false, audioOn = false, clockOn = false, stop = false, selHeld = false;
+    long vframes = 0;
+    uint64_t qTotal = 0;
+    uint32_t wall0 = 0, pauseAt = 0, pausedMs = 0;
+
+    while (!stop) {
+        uint32_t now = SDL_GetTicks();
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) { SDL_PushEvent(&e); stop = true; break; }
+            if (e.type != SDL_CONTROLLERBUTTONDOWN && e.type != SDL_CONTROLLERBUTTONUP) continue;
+            int b = e.cbutton.button;
+            bool down = e.type == SDL_CONTROLLERBUTTONDOWN;
+            if (cfg.swapAB) { if (b == SDL_CONTROLLER_BUTTON_A) b = SDL_CONTROLLER_BUTTON_B; else if (b == SDL_CONTROLLER_BUTTON_B) b = SDL_CONTROLLER_BUTTON_A; }
+            if (b == SDL_CONTROLLER_BUTTON_BACK) selHeld = down;
+            if (!down) continue;
+            if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_START) stop = true;
+            else if (b == SDL_CONTROLLER_BUTTON_A) {
+                paused = !paused;
+                if (dev) SDL_PauseAudioDevice(dev, paused || !audioOn);
+                if (paused) pauseAt = now; else pausedMs += now - pauseAt;
+                video_show(NULL, false);
+                if (paused) video_show(tex, true);
+            } else if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT || b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) {
+                double clk = pos;
+                if (dev && qTotal > 0) clk += (double)(qTotal - SDL_GetQueuedAudioSize(dev)) / ABPS;
+                else if (clockOn) clk += (double)(now - wall0 - pausedMs) / 1000.0;
+                pos = clk + (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT ? 10.0 : -10.0);
+                if (pos < 0) pos = 0;
+                vproc_stop(&vp);
+                vproc_start(&vp, ff, path, pos);
+                if (dev) { SDL_PauseAudioDevice(dev, 1); SDL_ClearQueuedAudio(dev); }
+                fgot = 0; vReady = vEOF = aEOF = audioOn = clockOn = paused = false;
+                vframes = 0; qTotal = 0; pausedMs = 0;
+            }
+        }
+        (void)selHeld;
+        if (stop) break;
+        if (paused) { SDL_Delay(30); continue; }
+
+        if (dev && !aEOF) {                           /* keep about a second of audio queued */
+            while (SDL_GetQueuedAudioSize(dev) < ABPS) {
+                ssize_t n = read(vp.afd, abuf, sizeof abuf);
+                if (n > 0) { SDL_QueueAudio(dev, abuf, (Uint32)n); qTotal += (uint64_t)n; }
+                else { if (n == 0 || (errno != EAGAIN && errno != EINTR)) aEOF = true; break; }
+            }
+        }
+        for (int i = 0; i < 8 && !vReady && !vEOF; i++) {
+            ssize_t n = read(vp.vfd, frame + fgot, VFRAME - fgot);
+            if (n > 0) { fgot += (size_t)n; if (fgot == VFRAME) { vReady = true; fgot = 0; } }
+            else { if (n == 0 || (errno != EAGAIN && errno != EINTR)) vEOF = true; break; }
+        }
+        if (vReady && !clockOn && (!dev || SDL_GetQueuedAudioSize(dev) >= ABPS / 5 || aEOF)) {
+            clockOn = true;                            /* first picture is ready: start the clocks together */
+            wall0 = now;
+            if (dev) { audioOn = true; SDL_PauseAudioDevice(dev, 0); }
+        }
+        if (clockOn) {
+            double clk = pos;
+            bool audioClock = dev && qTotal > 0 && !(aEOF && SDL_GetQueuedAudioSize(dev) == 0);
+            if (audioClock) clk += (double)(qTotal - SDL_GetQueuedAudioSize(dev)) / ABPS;
+            else clk += (double)(now - wall0 - pausedMs) / 1000.0;
+            double ft = pos + (double)vframes / VFPS;
+            if (vReady && ft <= clk + 0.01) {
+                if (clk - ft < 0.25) {                 /* on time: show it; far behind: drop it to catch up */
+                    SDL_UpdateYUVTexture(tex, NULL, frame, VW, frame + VW * VH, VW / 2, frame + VW * VH * 5 / 4, VW / 2);
+                    video_show(tex, false);
+                }
+                vReady = false;
+                vframes++;
+            }
+        }
+        if (vEOF && !vReady) break;
+        SDL_Delay(2);
+    }
+    if (!stop && dev) {                                /* let the last of the sound play out */
+        uint32_t t = SDL_GetTicks();
+        while (SDL_GetQueuedAudioSize(dev) > 0 && SDL_GetTicks() - t < 4000) SDL_Delay(20);
+    }
+    vproc_stop(&vp);
+    if (dev) SDL_CloseAudioDevice(dev);
+    if (audioInit) SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    SDL_DestroyTexture(tex);
+    free(frame);
+    heldPad = heldL = heldR = heldPrev = 0;
+    redrawFrames = 8;
+    return true;
+}
+
 static void tab_label(int i, char *out, size_t n) {
     const Source *s = &srcs[tabs[i].src];
     char lab[40];
@@ -2010,7 +2224,7 @@ static void build_menu(void) {
     add_mi(MI_SRC, 4);                       /* Homestuck, big */
     add_mi(MI_HEAD, 0);
     static const int adv[] = {3, 2, 1, 0, 5};
-    for (int i = 0; i < 5; i++) add_mi(MI_SRC, adv[i]);
+    for (int i = 0; i < 5; i++) if (adv[i] != 5 || cfg.showRQ) add_mi(MI_SRC, adv[i]);
     add_mi(MI_HEAD, 1);
     for (int c = 1; c < nCats; c++) {
         if (cats[c].n == 1) add_mi(MI_SRC, cats[c].first); else add_mi(MI_CAT, c);
@@ -2153,7 +2367,7 @@ static const char *img_label(char *buf, size_t n) {
     return buf;
 }
 
-enum { S_IMG, S_TEXT, S_SCROLL, S_AUTO, S_LOGS, S_LIGHT, S_PAGENUM, S_GIF, S_SMOOTH, S_LINK, S_START, S_SWAP, S_CLEAR, S_BACK, S_COUNT };
+enum { S_IMG, S_TEXT, S_SCROLL, S_AUTO, S_LOGS, S_LIGHT, S_PAGENUM, S_GIF, S_SMOOTH, S_LINK, S_START, S_RQ, S_SWAP, S_CLEAR, S_BACK, S_COUNT };
 
 static void draw_settings(void) {
     fill(C_BG, 0, 0, SCR_W, SCR_H);
@@ -2174,18 +2388,19 @@ static void draw_settings(void) {
     snprintf(v[S_SMOOTH], 40, "< %s >", cfg.smooth ? "Smooth" : "Sharp pixels");
     snprintf(v[S_LINK], 40, "< %s >", cfg.linkNewTab ? "New tab" : "This tab");
     snprintf(v[S_START], 40, "< %s >", cfg.startMenu ? "Main menu" : "Resume tabs");
+    snprintf(v[S_RQ], 40, "< %s >", cfg.showRQ ? "Shown" : "Hidden");
     snprintf(v[S_SWAP], 40, "< %s >", cfg.swapAB ? "On" : "Off");
     snprintf(v[S_CLEAR], 40, "A: clear");
     v[S_BACK][0] = 0;
     static const char *nm[S_COUNT] = {"Image size", "Text size", "Scroll speed", "Auto-play Flash pages", "Pesterlogs & other logs", "Light-coloured text", "Page numbers", "Animate GIFs",
-                                      "Image scaling", "Links open in", "On start", "Swap A/B buttons", "Clear read history", "Back"};
+                                      "Image scaling", "Links open in", "On start", "Show Ryanquest", "Swap A/B buttons", "Clear read history", "Back"};
     static const char *ds[S_COUNT] = {"How big page art is drawn. Smaller = more text visible without scrolling.",
         "Page text size.", "How fast Up/Down scrolls a page.", "Start a page's Flash automatically when you arrive on it.",
         "Start logs hidden behind a Show button, like the website.",
         "White text (Doctor Scratch etc.): blue highlight, dark box, light gray, or darkened.",
         "Story pages = 1..8130 for Homestuck like the Collection; MSPA ids = 001901..010030.", "Off = still pictures (smoother on slow devices).",
         "Sharp pixels keeps pixel art crisp; Smooth blurs it slightly when resized.", "Where links from the link list (Start) open when you press A.",
-        "Resume the tabs you had open, or always start at the main menu.", "For controllers whose A/B are labelled the other way round.",
+        "Resume the tabs you had open, or always start at the main menu.", "Ryanquest is a side story: hidden from the main menu unless this is on.", "For controllers whose A/B are labelled the other way round.",
         "Forget which pages you've read (purple links).", ""};
     int rows = 9, first = setSel - rows / 2;
     if (first + rows > S_COUNT) first = S_COUNT - rows;
@@ -2223,6 +2438,7 @@ static void settings_adjust(int dir) {
     case S_SMOOTH: cfg.smooth = !cfg.smooth; break;
     case S_LINK: cfg.linkNewTab = !cfg.linkNewTab; break;
     case S_START: cfg.startMenu = !cfg.startMenu; break;
+    case S_RQ: cfg.showRQ = !cfg.showRQ; break;
     case S_SWAP: cfg.swapAB = !cfg.swapAB; break;
     case S_CLEAR: if (dir == 0) { visited_clear(); toast("Read history cleared"); } return;
     default: return;
@@ -2231,6 +2447,7 @@ static void settings_adjust(int dir) {
     if (setSel == S_TEXT) apply_text_size();
     else if (setSel == S_LOGS) { logOpen = !cfg.collapseLogs; rebuild_layout(); }
     else if (setSel == S_IMG || setSel == S_LIGHT || setSel == S_PAGENUM) rebuild_layout();
+    else if (setSel == S_RQ) build_menu();
     else if (setSel == S_SMOOTH && havePage) {           /* textures are made with the scaling mode: reload the page */
         char k[24];
         snprintf(k, sizeof k, "%s", page.id);
@@ -2328,9 +2545,9 @@ static void draw_page(void) {
     if (scrollY > ms) scrollY = ms;
     if (scrollY < 0) scrollY = 0;
     int oy = TB - scrollY;
-    fill(C_BG, 0, 0, SCR_W, SCR_H);
-    fill(C_PANEL, PNL_X, TB, PNL_W, VIEW_H);
-    fill(C_COL, COL_X, COL_TOP + oy, COL_W, pageH - COL_TOP);
+    fill(th->bg, 0, 0, SCR_W, SCR_H);
+    fill(th->panel, PNL_X, TB, PNL_W, VIEW_H);
+    fill(th->col, COL_X, COL_TOP + oy, COL_W, pageH - COL_TOP);
 
     for (int i = 0; i < nMedia; i++) {
         Media *m = &media[i];
